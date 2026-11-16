@@ -8,27 +8,21 @@
 //! everything queued to QUIC in one call. JS never touches the connection lock, a run of small
 //! writes is batched, and writes keep their call order even when JS does not await them.
 //!
-//! Receive side: every read first takes its turn on the half's FIFO lock, on the JS thread, and
-//! if the turn is free it is tried right there: data QUIC already holds settles the promise
-//! without leaving the JS thread. Only a read that has to wait moves to the tokio runtime.
+//! Receive side: a reader task owns the QUIC stream and moves what has arrived (up to about
+//! 1 MiB ahead of JS) into the stream's queue. `read` takes from the queue on the JS thread and
+//! settles its promise right there; only a read that finds nothing waits for the task.
 //!
-//! `stop` and `reset` raise the half's cancel signal, which makes a waiting read or write give
-//! up, so they never wait on a peer that stays silent or withholds flow-control credit.
+//! Neither half sits behind a lock that is held across an await, and JS never takes QUIC's
+//! connection lock. `stop` and `reset` settle the waiting reads or writes themselves and wake the
+//! task, so they never wait on a peer that stays silent or withholds flow-control credit.
 
-use std::{
-    cell::Cell,
-    collections::VecDeque,
-    future::Future,
-    pin::{Pin, pin},
-    sync::Arc,
-    task::{Context, Poll, Waker},
-};
+use std::{cell::Cell, collections::VecDeque, sync::Arc};
 
 use bytes::Bytes;
 use iroh::endpoint::{self, ReadError, VarInt};
 use napi::{JsDeferred, bindgen_prelude::*};
 use napi_derive::napi;
-use tokio::sync::{Mutex, Notify, OwnedMutexGuard, watch};
+use tokio::sync::{Notify, watch};
 
 use crate::js_err;
 
@@ -37,40 +31,6 @@ use crate::js_err;
 async fn cancelled(mut rx: watch::Receiver<bool>) {
     if rx.wait_for(|requested| *requested).await.is_err() {
         std::future::pending::<()>().await;
-    }
-}
-
-// Polls a future once without registering for a wakeup. Only for futures that are cancel safe and
-// are either dropped or polled again from a real task afterwards.
-fn poll_once<F: Future>(fut: Pin<&mut F>) -> Poll<F::Output> {
-    fut.poll(&mut Context::from_waker(Waker::noop()))
-}
-
-// An operation's place in a half's FIFO: the lock itself, or the queued wait for it.
-enum Turn<T> {
-    Now(OwnedMutexGuard<T>),
-    Later(Pin<Box<dyn Future<Output = OwnedMutexGuard<T>> + Send>>),
-}
-
-impl<T: Send + 'static> Turn<T> {
-    // Called on the JS thread. tokio's mutex is fair, and the wait is queued here (by the first
-    // poll) rather than whenever a runtime thread gets to it, so turns follow JS call order.
-    fn take(lock: &Arc<Mutex<T>>) -> Self {
-        if let Ok(guard) = lock.clone().try_lock_owned() {
-            return Self::Now(guard);
-        }
-        let mut wait = Box::pin(lock.clone().lock_owned());
-        match poll_once(wait.as_mut()) {
-            Poll::Ready(guard) => Self::Now(guard),
-            Poll::Pending => Self::Later(wait),
-        }
-    }
-
-    async fn guard(self) -> OwnedMutexGuard<T> {
-        match self {
-            Self::Now(guard) => guard,
-            Self::Later(wait) => wait.await,
-        }
     }
 }
 
@@ -434,89 +394,197 @@ impl SendStream {
 /// Largest `max` a single read honors; larger requests are clamped.
 pub const MAX_READ: usize = 4 << 20;
 
+// Bytes a receive side takes from QUIC ahead of JS. Beyond it the data stays in QUIC, whose flow
+// control then holds the peer back.
+const READ_AHEAD: usize = 1 << 20;
+
 // QUIC hands stream data out as one refcounted chunk per received STREAM frame, so a chunk is
-// about one packet. Asking for `max / MIN_CHUNK` chunks lets a read reach `max` bytes.
+// about one packet. Asking for `bytes / MIN_CHUNK` chunks lets one call reach `bytes`.
 const MIN_CHUNK: usize = 1024;
 
-struct RecvInner {
-    stream: endpoint::RecvStream,
-    // Chunks QUIC already handed over that did not fit the previous read's `max`.
-    carry: VecDeque<Bytes>,
-    // Scratch slots for `read_many_chunks`, kept to avoid a per-read allocation of empties.
-    slots: Vec<Bytes>,
+// A read promise the reader task settles from the runtime.
+type ReadResolver = Box<dyn FnOnce(Env) -> Result<Option<ReadBytes>> + Send>;
+type ReadSettle = JsDeferred<Option<ReadBytes>, ReadResolver>;
+
+fn pending_read<'env>(env: &'env Env) -> Result<(ReadSettle, PromiseRaw<'env, Option<ReadBytes>>)> {
+    let (settle, promise) = env.create_deferred()?;
+    Ok((settle, PromiseRaw::new(env.raw(), promise.raw())))
 }
 
-impl RecvInner {
-    // Takes up to `max` bytes from `carry`.
-    fn take_carry(&mut self, max: usize) -> ReadBytes {
+fn settle_read(settle: ReadSettle, outcome: std::result::Result<Option<ReadBytes>, String>) {
+    match outcome {
+        Ok(read) => settle.resolve(Box::new(move |_| Ok(read))),
+        Err(e) => settle.reject(js_err(e)),
+    }
+}
+
+// What the reader task has received for JS, and what JS has asked of it.
+#[derive(Default)]
+struct RecvState {
+    // Received, not yet read by JS.
+    queue: VecDeque<Bytes>,
+    queued: usize,
+    // Reads waiting for data, in call order, with their `max`. Only while `queue` is empty.
+    waiters: VecDeque<(usize, ReadSettle)>,
+    // How the stream ended: cleanly, or with the error every later read rejects with.
+    end: Option<std::result::Result<(), String>>,
+    stop: Option<(VarInt, Settle)>,
+    // The task is parked on a full queue and wants a wakeup once JS has made room.
+    full: bool,
+    // The JS object is gone: the task ends once no read is waiting.
+    dropped: bool,
+}
+
+impl RecvState {
+    // Takes up to `max` bytes off the queue.
+    fn take(&mut self, max: usize) -> ReadBytes {
         let mut out = ReadBytes::default();
         while out.len < max {
-            let Some(mut chunk) = self.carry.pop_front() else {
+            let Some(mut chunk) = self.queue.pop_front() else {
                 break;
             };
             let room = max - out.len;
             if chunk.len() > room {
                 let rest = chunk.split_off(room);
-                self.carry.push_front(rest);
+                self.queue.push_front(rest);
             }
             out.push(chunk);
         }
+        self.queued -= out.len;
         out
     }
+}
 
-    // Waits for data, then gathers every chunk QUIC has ready (up to `max` bytes) under a single
-    // connection lock. No byte is copied here. `None` is end of stream.
-    async fn read(&mut self, max: usize) -> std::result::Result<Option<ReadBytes>, ReadError> {
-        if self.carry.is_empty() {
-            let want = max.div_ceil(MIN_CHUNK);
-            if self.slots.len() < want {
-                self.slots.resize(want, Bytes::new());
-            }
-            let Some(n) = self
-                .stream
-                .read_many_chunks(&mut self.slots[..want])
-                .await?
-            else {
-                return Ok(None);
-            };
-            self.carry
-                .extend(self.slots[..n].iter_mut().map(std::mem::take));
-        }
-        Ok(Some(self.take_carry(max)))
+struct RecvShared {
+    state: std::sync::Mutex<RecvState>,
+    // Wakes the task: room in the queue, a stop, or the JS object is gone.
+    work: Notify,
+}
+
+impl RecvShared {
+    fn state(&self) -> std::sync::MutexGuard<'_, RecvState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn stop(&mut self, code: VarInt) -> std::result::Result<(), endpoint::ClosedStream> {
-        self.carry.clear();
-        self.stream.stop(code)
+    // The reader task: sole owner of the QUIC stream. It moves what QUIC has received into the
+    // queue (refcounted, no copy), every ready chunk under one connection lock, so a read from
+    // JS only has to take from the queue.
+    async fn drive(self: Arc<Self>, mut stream: endpoint::RecvStream) {
+        enum Next {
+            Read(usize),
+            Stop(VarInt, Settle),
+            Park,
+            End,
+        }
+        let mut slots = vec![Bytes::new(); READ_AHEAD / MIN_CHUNK];
+        loop {
+            let next = {
+                let mut st = self.state();
+                if let Some((code, done)) = st.stop.take() {
+                    Next::Stop(code, done)
+                } else if st.dropped && st.waiters.is_empty() {
+                    Next::End
+                } else if st.end.is_some() {
+                    Next::Park
+                } else if st.queued >= READ_AHEAD {
+                    st.full = true;
+                    Next::Park
+                } else {
+                    Next::Read((READ_AHEAD - st.queued).div_ceil(MIN_CHUNK))
+                }
+            };
+            match next {
+                Next::Park => self.work.notified().await,
+                // Dropping the stream tells the peer to stop sending, unless it has ended.
+                Next::End => return,
+                Next::Stop(code, done) => settle(done, stream.stop(code)),
+                Next::Read(want) => {
+                    let read = tokio::select! {
+                        biased;
+                        // A stop or a drop: the next pass serves it.
+                        () = self.work.notified() => continue,
+                        read = stream.read_many_chunks(&mut slots[..want]) => read,
+                    };
+                    self.received(read.map(|n| n.map(|n| &mut slots[..n])));
+                }
+            }
+        }
+    }
+
+    // Queues what the task read and serves the reads that were waiting for it.
+    fn received(&self, read: std::result::Result<Option<&mut [Bytes]>, ReadError>) {
+        let mut ready = Vec::new();
+        {
+            let mut st = self.state();
+            if st.end.is_some() {
+                // Stopped in the meantime: the data is no longer wanted.
+                return;
+            }
+            match read {
+                Ok(Some(chunks)) => {
+                    for chunk in chunks.iter_mut().map(std::mem::take) {
+                        if !chunk.is_empty() {
+                            st.queued += chunk.len();
+                            st.queue.push_back(chunk);
+                        }
+                    }
+                    while !st.queue.is_empty() {
+                        let Some((max, waiter)) = st.waiters.pop_front() else {
+                            break;
+                        };
+                        ready.push((waiter, Ok(Some(st.take(max)))));
+                    }
+                }
+                Ok(None) => {
+                    st.end = Some(Ok(()));
+                    ready.extend(st.waiters.drain(..).map(|w| (w.1, Ok(None))));
+                }
+                Err(e) => {
+                    let why = e.to_string();
+                    ready.extend(st.waiters.drain(..).map(|w| (w.1, Err(why.clone()))));
+                    st.end = Some(Err(why));
+                }
+            }
+        }
+        for (waiter, outcome) in ready {
+            settle_read(waiter, outcome);
+        }
     }
 }
 
 /// Receiving half of a bidirectional stream.
 #[napi]
 pub struct RecvStream {
-    inner: Arc<Mutex<RecvInner>>,
-    cancel: watch::Sender<bool>,
+    shared: Arc<RecvShared>,
+}
+
+impl Drop for RecvStream {
+    fn drop(&mut self) {
+        self.shared.state().dropped = true;
+        self.shared.work.notify_one();
+    }
 }
 
 impl RecvStream {
     pub(crate) fn new(r: endpoint::RecvStream) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(RecvInner {
-                stream: r,
-                carry: VecDeque::new(),
-                slots: Vec::new(),
-            })),
-            cancel: watch::Sender::new(false),
-        }
+        let shared = Arc::new(RecvShared {
+            state: Default::default(),
+            work: Notify::new(),
+        });
+        spawn(shared.clone().drive(r));
+        Self { shared }
     }
 }
 
 #[napi]
 impl RecvStream {
-    /// Reads whatever is available (at least 1 byte, at most `max`, which is clamped to 4 MiB),
-    /// gathering every chunk QUIC has already received so one JS call covers many packets;
-    /// resolves null at end of stream. Rejects if the peer reset the stream (message contains the
-    /// reset code).
+    /// Reads whatever has arrived (at least 1 byte, at most `max`, which is clamped to 4 MiB) as
+    /// one Buffer covering many packets; waits only if nothing has arrived yet. Resolves null at
+    /// end of stream. Rejects if the peer reset the stream (message contains the reset code),
+    /// after the bytes received before the reset have been read.
+    ///
+    /// About 1 MiB per stream is taken from QUIC ahead of the reads; a slower reader holds the
+    /// peer back through QUIC flow control.
     #[napi(ts_return_type = "Promise<Buffer | null>")]
     pub fn read<'env>(
         &self,
@@ -526,49 +594,63 @@ impl RecvStream {
         if max == 0 {
             return rejected(env, "max must be > 0");
         }
-        if *self.cancel.borrow() {
-            return rejected(env, "stream stopped");
-        }
         let max = (max as usize).min(MAX_READ);
-        let mut turn = Turn::take(&self.inner);
-        if let Turn::Now(inner) = &mut turn
-            && inline_allowed()
-        {
-            match poll_once(pin!(inner.read(max))) {
-                Poll::Ready(Ok(read)) => {
-                    inline_spent(read.as_ref().map_or(0, |r| r.len));
-                    let value = unsafe { ToNapiValue::to_napi_value(env.raw(), read) }?;
-                    return resolved(env, value);
+        let mut st = self.shared.state();
+        let read = if !st.queue.is_empty() {
+            let bytes = st.take(max);
+            // Half the queue is free again: worth waking the task for.
+            if st.full && st.queued <= READ_AHEAD / 2 {
+                st.full = false;
+                self.shared.work.notify_one();
+            }
+            Some(bytes)
+        } else {
+            match &st.end {
+                Some(Ok(())) => None,
+                Some(Err(why)) => return rejected(env, why.clone()),
+                None => {
+                    let (waiter, promise) = pending_read(env)?;
+                    st.waiters.push_back((max, waiter));
+                    return Ok(promise);
                 }
-                Poll::Ready(Err(e)) => return rejected(env, e),
-                // Nothing received yet: nothing was consumed.
-                Poll::Pending => {}
             }
+        };
+        drop(st);
+        if inline_allowed() {
+            inline_spent(read.as_ref().map_or(0, |r| r.len));
+            let value = unsafe { ToNapiValue::to_napi_value(env.raw(), read) }?;
+            return resolved(env, value);
         }
-        let cancel = self.cancel.subscribe();
-        env.spawn_future(async move {
-            // A stop abandons the read; otherwise wait for data, end of stream or a peer reset.
-            tokio::select! {
-                biased;
-                () = cancelled(cancel) => Err(js_err("stream stopped")),
-                read = async { turn.guard().await.read(max).await } => read.map_err(js_err),
-            }
-        })
+        // Over the inline budget: the same result, settled through the event loop.
+        let (later, promise) = pending_read(env)?;
+        settle_read(later, Ok(read));
+        Ok(promise)
     }
 
-    /// Asks the peer to stop sending, with an application error code. A pending read rejects
-    /// first, so STOP_SENDING is not held up by a peer that stays silent.
+    /// Asks the peer to stop sending, with an application error code. Pending and later reads
+    /// reject and unread bytes are dropped, so STOP_SENDING is not held up by a peer that stays
+    /// silent.
     #[napi(ts_return_type = "Promise<void>")]
     pub fn stop<'env>(&self, env: &'env Env, code: u32) -> Result<PromiseRaw<'env, ()>> {
-        self.cancel.send_replace(true);
-        let code = VarInt::from_u32(code);
-        match Turn::take(&self.inner) {
-            Turn::Now(mut inner) => match inner.stop(code) {
-                Ok(()) => resolved_void(env),
-                Err(e) => rejected(env, e),
-            },
-            turn => env.spawn_future(async move { turn.guard().await.stop(code).map_err(js_err) }),
+        const STOPPED: &str = "stream stopped";
+        let (done, promise) = pending(env)?;
+        let (waiters, earlier) = {
+            let mut st = self.shared.state();
+            st.queue.clear();
+            st.queued = 0;
+            st.end = Some(Err(STOPPED.into()));
+            let waiters = std::mem::take(&mut st.waiters);
+            (waiters, st.stop.replace((VarInt::from_u32(code), done)))
+        };
+        for (_, waiter) in waiters {
+            waiter.reject(js_err(STOPPED));
         }
+        if let Some((_, earlier)) = earlier {
+            // Two stops in a row: the task serves the later one, QUIC keeps the first code.
+            earlier.reject(js_err(CLOSED));
+        }
+        self.shared.work.notify_one();
+        Ok(promise)
     }
 }
 
