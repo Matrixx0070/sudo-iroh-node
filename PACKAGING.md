@@ -25,11 +25,15 @@ The platform package manifests live in `npm/<platform>/package.json` (generated 
 
 On every push to `main` and every pull request:
 
-1. **build**: seven jobs, one per target. macOS and Windows build natively; Linux glibc targets use
-   `--use-napi-cross` (the napi-rs cross toolchain, glibc 2.17 baseline); Linux musl targets use
-   `-x` (cargo-zigbuild). Each uploads its `.node` as the artifact `bindings-<target>`.
-2. **test**: runs `npm test` against the built binary on linux-x64 (glibc), darwin-arm64 and win32-x64.
-   The tests need nothing from npm. The compat tests against `@number0/iroh` skip themselves there.
+1. **build**: seven jobs, one per target. macOS and Windows build natively. linux-x64-gnu uses
+   `--use-napi-cross` (the napi-rs cross toolchain, glibc 2.17 baseline). The musl targets and
+   linux-arm64-gnu use `-x` (cargo-zigbuild); arm64 glibc is pinned to the same baseline with the target
+   spelling `aarch64-unknown-linux-gnu.2.17`. It does not use `--use-napi-cross` because that toolchain's
+   gcc cannot assemble ring's aarch64 sources. Each job uploads its `.node` as the artifact
+   `bindings-<target>`.
+2. **test**: runs `npm test` against the built binary on linux-x64 (glibc), linux-arm64 (glibc),
+   darwin-arm64 and win32-x64. The tests need nothing from npm. The compat tests against `@number0/iroh`
+   skip themselves there.
 
 On a `v*` tag, additionally:
 
@@ -61,7 +65,7 @@ git push origin main --follow-tags
 `npm version` runs the `version` script, which stamps the new version into the platform packages
 (`napi version`), the loader's `optionalDependencies`, `Cargo.toml`, `Cargo.lock` and the version check
 inside the generated `index.js` (`scripts/sync-versions.cjs`), and adds those files to the version commit. The pushed tag `v0.2.0` starts
-the workflow; nothing is published before every build and all three test jobs are green.
+the workflow; nothing is published before every build and every test job is green.
 
 A prerelease version (`npm version 0.2.0-rc.1`) is published under the dist-tag `next` instead of
 `latest`.

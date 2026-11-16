@@ -30,12 +30,17 @@ jobs:
             build: npm run build -- --target x86_64-unknown-linux-gnu --use-napi-cross
           - host: ubuntu-latest
             target: x86_64-unknown-linux-musl
+            zig: true
             build: npm run build -- --target x86_64-unknown-linux-musl -x
+          # Not --use-napi-cross: its gcc cannot assemble ring's aarch64 sources ("ARM assembler must
+          # define __ARM_ARCH"). zig builds them; the .2.17 suffix pins the same glibc baseline.
           - host: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            build: npm run build -- --target aarch64-unknown-linux-gnu --use-napi-cross
+            zig: true
+            build: npm run build -- --target aarch64-unknown-linux-gnu.2.17 -x
           - host: ubuntu-latest
             target: aarch64-unknown-linux-musl
+            zig: true
             build: npm run build -- --target aarch64-unknown-linux-musl -x
           - host: macos-latest
             target: aarch64-apple-darwin
@@ -71,12 +76,12 @@ jobs:
             target/
           key: ${{ matrix.settings.target }}-cargo-${{ matrix.settings.host }}-${{ hashFiles('Cargo.lock') }}
       - uses: mlugg/setup-zig@v2
-        if: ${{ contains(matrix.settings.target, 'musl') }}
+        if: ${{ matrix.settings.zig }}
         with:
           version: 0.15.2
       - name: Install cargo-zigbuild
         uses: taiki-e/install-action@v2
-        if: ${{ contains(matrix.settings.target, 'musl') }}
+        if: ${{ matrix.settings.zig }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
         with:
@@ -105,6 +110,8 @@ jobs:
         settings:
           - host: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - host: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
           - host: macos-latest
             target: aarch64-apple-darwin
           - host: windows-latest
