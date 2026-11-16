@@ -20,7 +20,8 @@
     "build": "napi build --platform --release --strip",
     "build:debug": "napi build --platform",
     "test": "node --test test/*.test.cjs",
-    "bench": "IROH_NODE_BENCH=1 node --test test/throughput.test.cjs"
+    "bench": "IROH_NODE_BENCH=1 node --test test/throughput.test.cjs",
+    "build:fast": "napi build --platform --profile fast"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.10.9"

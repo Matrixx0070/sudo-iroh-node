@@ -64,9 +64,10 @@ export declare class HomeRelayWatcher {
 /** Receiving half of a bidirectional stream. */
 export declare class RecvStream {
   /**
-   * Reads whatever is available (at least 1 byte, at most `max`), gathering every chunk QUIC has
-   * already received so one JS call covers many packets; resolves null at end of stream.
-   * Rejects if the peer reset the stream (message contains the reset code).
+   * Reads whatever is available (at least 1 byte, at most `max`, which is clamped to 4 MiB),
+   * gathering every chunk QUIC has already received so one JS call covers many packets;
+   * resolves null at end of stream. Rejects if the peer reset the stream (message contains the
+   * reset code).
    */
   read(max: number): Promise<Buffer | null>
   /**

@@ -1,20 +1,19 @@
-//! Stream halves. Reads copy the received bytes into a JS-owned Buffer on the JS thread; writes
-//! copy the caller's Buffer/Uint8Array once on the JS thread (so JS may reuse it immediately) and
-//! then await QUIC flow control off-thread.
+//! Stream halves. Each direction copies the payload exactly once: a write copies the caller's
+//! Buffer/Uint8Array into refcounted bytes on the JS thread (so JS may reuse it immediately) and
+//! hands those to QUIC; a read gathers QUIC's received chunks without copying and copies them into
+//! one JS-owned Buffer on the JS thread.
 //!
 //! Each half serializes I/O behind a mutex. `stop` and `reset` first raise the half's cancel
 //! signal, which makes a pending read or write give up its lock, so they never wait on a peer
 //! that stays silent or withholds flow-control credit.
 
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 
-use iroh::endpoint::{self, VarInt};
+use bytes::Bytes;
+use iroh::endpoint::{self, ReadError, VarInt};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use tokio::{
-    io::AsyncReadExt,
-    sync::{Mutex, watch},
-};
+use tokio::sync::{Mutex, watch};
 
 use crate::js_err;
 
@@ -47,7 +46,9 @@ impl SendStream {
     /// Writes all bytes; resolves when QUIC has accepted them (flow-control backpressure).
     #[napi(ts_return_type = "Promise<void>")]
     pub fn write<'env>(&self, env: &'env Env, data: &[u8]) -> Result<PromiseRaw<'env, ()>> {
-        let bytes = data.to_vec();
+        // The one copy: JS may reuse `data` as soon as this returns, and QUIC keeps the bytes
+        // (refcounted, never copied again) until they are acknowledged.
+        let bytes = Bytes::copy_from_slice(data);
         let inner = self.inner.clone();
         let cancel = self.cancel.subscribe();
         env.spawn_future(async move {
@@ -55,7 +56,7 @@ impl SendStream {
             tokio::select! {
                 biased;
                 () = cancelled(cancel) => Err(js_err("stream reset")),
-                written = async { inner.lock().await.write_all(&bytes).await } => {
+                written = async { inner.lock().await.write_chunk(bytes).await } => {
                     written.map_err(js_err)
                 }
             }
@@ -81,17 +82,76 @@ impl SendStream {
     }
 }
 
+/// Largest `max` a single read honors; larger requests are clamped.
+pub const MAX_READ: usize = 4 << 20;
+
+// QUIC hands stream data out as one refcounted chunk per received STREAM frame, so a chunk is
+// about one packet. Asking for `max / MIN_CHUNK` chunks lets a read reach `max` bytes.
+const MIN_CHUNK: usize = 1024;
+
+struct RecvInner {
+    stream: endpoint::RecvStream,
+    // Chunks QUIC already handed over that did not fit the previous read's `max`.
+    carry: VecDeque<Bytes>,
+    // Scratch slots for `read_many_chunks`, kept to avoid a per-read allocation of empties.
+    slots: Vec<Bytes>,
+}
+
+impl RecvInner {
+    // Takes up to `max` bytes from `carry`.
+    fn take_carry(&mut self, max: usize) -> ReadBytes {
+        let mut out = ReadBytes::default();
+        while out.len < max {
+            let Some(mut chunk) = self.carry.pop_front() else {
+                break;
+            };
+            let room = max - out.len;
+            if chunk.len() > room {
+                let rest = chunk.split_off(room);
+                self.carry.push_front(rest);
+            }
+            out.push(chunk);
+        }
+        out
+    }
+
+    // Waits for data, then gathers every chunk QUIC has ready (up to `max` bytes) under a single
+    // connection lock. No byte is copied here. `None` is end of stream.
+    async fn read(&mut self, max: usize) -> std::result::Result<Option<ReadBytes>, ReadError> {
+        if self.carry.is_empty() {
+            let want = max.div_ceil(MIN_CHUNK);
+            if self.slots.len() < want {
+                self.slots.resize(want, Bytes::new());
+            }
+            let Some(n) = self
+                .stream
+                .read_many_chunks(&mut self.slots[..want])
+                .await?
+            else {
+                return Ok(None);
+            };
+            self.carry
+                .extend(self.slots[..n].iter_mut().map(std::mem::take));
+        }
+        Ok(Some(self.take_carry(max)))
+    }
+}
+
 /// Receiving half of a bidirectional stream.
 #[napi]
 pub struct RecvStream {
-    inner: Mutex<endpoint::RecvStream>,
+    inner: Mutex<RecvInner>,
     cancel: watch::Sender<bool>,
 }
 
 impl RecvStream {
     pub(crate) fn new(r: endpoint::RecvStream) -> Self {
         Self {
-            inner: Mutex::new(r),
+            inner: Mutex::new(RecvInner {
+                stream: r,
+                carry: VecDeque::new(),
+                slots: Vec::new(),
+            }),
             cancel: watch::Sender::new(false),
         }
     }
@@ -99,25 +159,22 @@ impl RecvStream {
 
 #[napi]
 impl RecvStream {
-    /// Reads whatever is available (at least 1 byte, at most `max`), gathering every chunk QUIC has
-    /// already received so one JS call covers many packets; resolves null at end of stream.
-    /// Rejects if the peer reset the stream (message contains the reset code).
+    /// Reads whatever is available (at least 1 byte, at most `max`, which is clamped to 4 MiB),
+    /// gathering every chunk QUIC has already received so one JS call covers many packets;
+    /// resolves null at end of stream. Rejects if the peer reset the stream (message contains the
+    /// reset code).
     #[napi(ts_return_type = "Promise<Buffer | null>")]
     pub async fn read(&self, max: u32) -> Result<Option<ReadBytes>> {
         if max == 0 {
             return Err(js_err("max must be > 0"));
         }
-        // read_buf fills spare capacity without zeroing it; 0 bytes read with room left means EOF.
-        let mut buf = Vec::with_capacity(max as usize);
+        let max = (max as usize).min(MAX_READ);
         // A stop abandons the read; otherwise wait for data, end of stream or a peer reset.
-        let n = tokio::select! {
+        tokio::select! {
             biased;
-            () = cancelled(self.cancel.subscribe()) => return Err(js_err("stream stopped")),
-            read = async { self.inner.lock().await.read_buf(&mut buf).await } => {
-                read.map_err(js_err)?
-            }
-        };
-        Ok((n > 0).then_some(ReadBytes(buf)))
+            () = cancelled(self.cancel.subscribe()) => Err(js_err("stream stopped")),
+            read = async { self.inner.lock().await.read(max).await } => read.map_err(js_err),
+        }
     }
 
     /// Asks the peer to stop sending, with an application error code. A pending read rejects
@@ -125,23 +182,48 @@ impl RecvStream {
     #[napi]
     pub async fn stop(&self, code: u32) -> Result<()> {
         self.cancel.send_replace(true);
-        self.inner
-            .lock()
-            .await
-            .stop(VarInt::from_u32(code))
-            .map_err(js_err)
+        let mut inner = self.inner.lock().await;
+        inner.carry.clear();
+        inner.stream.stop(VarInt::from_u32(code)).map_err(js_err)
     }
 }
 
-/// Bytes read off the JS thread. Converting them to JS copies them into a JS-owned Buffer and frees
-/// the Rust allocation at once, so read buffers never wait for a GC. (An external Buffer over the
-/// Vec lives until a later GC; under 8 parallel downloads those late frees left glibc's per-thread
-/// arenas holding ~70 MB more RSS.)
-pub struct ReadBytes(Vec<u8>);
+/// Received chunks, still owned by QUIC's buffers. Converting them to JS allocates one JS-owned
+/// Buffer of the exact size on the JS thread and copies the chunks into it: the only copy between
+/// the decrypted packet and JS. The chunks are freed right there, so read memory never waits for a
+/// GC.
+#[derive(Default)]
+pub struct ReadBytes {
+    chunks: Vec<Bytes>,
+    len: usize,
+}
+
+impl ReadBytes {
+    fn push(&mut self, chunk: Bytes) {
+        self.len += chunk.len();
+        self.chunks.push(chunk);
+    }
+}
 
 impl ToNapiValue for ReadBytes {
     unsafe fn to_napi_value(env: sys::napi_env, v: Self) -> Result<sys::napi_value> {
-        Ok(BufferSlice::copy_from(&Env::from_raw(env), &v.0)?.raw())
+        let mut data = std::ptr::null_mut();
+        let mut buffer = std::ptr::null_mut();
+        check_status!(
+            unsafe { sys::napi_create_buffer(env, v.len, &mut data, &mut buffer) },
+            "failed to allocate a {} byte Buffer",
+            v.len
+        )?;
+        let mut at = data.cast::<u8>();
+        for chunk in &v.chunks {
+            // SAFETY: `data` points at `v.len` writable bytes owned by the new Buffer, and the
+            // chunk lengths sum to `v.len`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(chunk.as_ptr(), at, chunk.len());
+                at = at.add(chunk.len());
+            }
+        }
+        Ok(buffer)
     }
 }
 

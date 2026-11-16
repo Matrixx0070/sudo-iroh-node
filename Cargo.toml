@@ -16,6 +16,7 @@ crate-type = ["cdylib"]
 [dependencies]
 # Same iroh as the SUDO relay and the browser crate: the wire must match exactly.
 iroh = "=1.4.1"
+bytes = "1"
 napi = { version = "3", default-features = false, features = ["napi8", "async"] }
 napi-derive = "3"
 tokio = { version = "1", features = ["sync", "io-util", "rt", "macros"] }
@@ -30,3 +31,9 @@ all = "warn"
 lto = true
 codegen-units = 1
 strip = "symbols"
+
+# Iteration profile (`npm run build:fast`): same optimization level without the multi-minute fat LTO link.
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
