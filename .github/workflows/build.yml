@@ -118,11 +118,19 @@ jobs:
           path: ${{ env.APP_NAME }}.*.node
           if-no-files-found: error
 
+  # Apple Silicon runners are scarce on hosted GitHub; this job may sit queued for a long time or never be
+  # acquired. It is therefore advisory for the run (continue-on-error) but still gates publishing: the publish
+  # job ships darwin-arm64 only when this job passed or was skipped/cancelled for lack of a runner, never when
+  # the bindings actually failed to load (see `outputs.result`).
   test-darwin-arm64:
     name: test aarch64-apple-darwin
     needs:
       - build
     runs-on: macos-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
     steps:
       - uses: actions/checkout@v7
       - name: Setup node
@@ -134,12 +142,29 @@ jobs:
         with:
           name: bindings-aarch64-apple-darwin
           path: .
+      - name: Runner is Apple Silicon
+        id: arch
+        run: |
+          echo "arch=$(uname -m)" >> "$GITHUB_OUTPUT"
+          uname -m
       - name: Test bindings
+        id: test
+        if: ${{ steps.arch.outputs.arch == 'arm64' }}
         run: npm test
+      - name: Verdict
+        id: verdict
+        if: ${{ always() }}
+        run: |
+          if [ "${{ steps.arch.outputs.arch }}" != "arm64" ]; then echo "result=no-arm64-runner" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.test.outcome }}" = "success" ]; then echo "result=passed" >> "$GITHUB_OUTPUT"
+          else echo "result=failed" >> "$GITHUB_OUTPUT"; fi
+          cat "$GITHUB_OUTPUT"
 
   publish:
     name: publish to npm
-    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    # Runs on a tag once every build is green. The darwin-arm64 test may have been skipped for lack of a runner
+    # (result empty or no-arm64-runner) — that is allowed; a real failure (result=failed) blocks the release.
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && needs.build.result == 'success' && needs.test-darwin-arm64.outputs.result != 'failed' }}
     needs:
       - build
       - test-darwin-arm64
