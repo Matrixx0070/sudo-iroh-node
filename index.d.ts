@@ -80,20 +80,28 @@ export declare class RecvStream {
 /** Sending half of a bidirectional stream. */
 export declare class SendStream {
   /**
-   * Writes all bytes; resolves when QUIC has accepted them (flow-control backpressure). The
-   * bytes are copied before this returns, so the caller may reuse `data` right away.
+   * Queues the bytes for QUIC, in call order. They are copied before this returns, so the
+   * caller may reuse `data` right away.
+   *
+   * Resolves at once while less than 1 MiB is waiting for QUIC, and otherwise when QUIC has
+   * accepted these bytes (flow-control backpressure). A failure of bytes that were queued when
+   * their write resolved (peer stopped the stream, connection lost) rejects the next `write`,
+   * `flush` or `finish`.
    */
   write(data: Uint8Array): Promise<void>
-  /**
-   * Writes several buffers in order as one operation: one promise and one pass through QUIC
-   * for the whole batch. Use it when many small frames are ready at once.
-   */
+  /** Like `write` for several buffers in order, with one promise for the whole batch. */
   writeMany(data: Array<Uint8Array>): Promise<void>
-  /** Ends the send side cleanly (FIN), after every write issued before it. */
+  /** Resolves when QUIC has accepted everything written so far; rejects if any of it failed. */
+  flush(): Promise<void>
+  /**
+   * Ends the send side cleanly (FIN) after everything written before it. Rejects if any of
+   * those bytes failed.
+   */
   finish(): Promise<void>
   /**
-   * Abandons the send side with an application error code. A pending write rejects first, so
-   * the reset is not held up by a peer that withholds flow-control credit.
+   * Abandons the send side with an application error code. Pending writes reject first and
+   * unsent bytes are dropped, so the reset is not held up by a peer that withholds
+   * flow-control credit.
    */
   reset(code: number): Promise<void>
 }

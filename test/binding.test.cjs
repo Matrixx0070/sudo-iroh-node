@@ -34,7 +34,7 @@ const API = {
     "rttMs",
     "setMaxConcurrentBiStreams",
   ],
-  SendStream: ["finish", "reset", "write", "writeMany"],
+  SendStream: ["finish", "flush", "reset", "write", "writeMany"],
   RecvStream: ["read", "stop"],
 };
 
@@ -350,6 +350,101 @@ test("a busy stream does not starve the event loop", async () => {
     // Tens of thousands of writes and reads settled on the JS thread; a 1 ms timer must have kept
     // firing in between (about 1000 times here; about 15 if settled promises never yield).
     assert.ok(ticks >= elapsedMs / 20, `timer ran only ${ticks} times in ${elapsedMs} ms`);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("a write past the high-water mark waits for the peer, smaller ones do not", async () => {
+  const { server, client, conn, sconn } = await directPair();
+  try {
+    const { local, peer } = await openedStream(conn, sconn);
+    // The peer reads nothing. Small writes still settle at once: they only queue.
+    const chunk = Buffer.alloc(64 << 10, 3);
+    let queued = 0;
+    let stalled = null;
+    while (queued < 64 << 20) {
+      const write = local.send.write(chunk);
+      queued += chunk.length;
+      const settled = await Promise.race([write.then(() => true), new Promise((r) => setTimeout(r, 300, false))]);
+      if (!settled) {
+        stalled = write;
+        break;
+      }
+    }
+    // Flow control (about 1 MiB of stream credit) plus the 1 MiB queue is the bound, not 64 MiB.
+    assert.ok(stalled, "writes never waited for the peer");
+    assert.ok(queued <= 16 << 20, `queued ${queued} bytes before backpressure`);
+    // Once the peer reads, the stalled write and a flush complete and every byte arrives.
+    const flushed = local.send.flush();
+    const got = readExactly(peer.recv, queued);
+    await within(stalled, 5000, "stalled write");
+    await within(flushed, 5000, "flush");
+    await local.send.finish();
+    assert.equal((await within(got, 5000, "peer read")).length, queued);
+    assert.equal(await peer.recv.read(16), null);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("a failed write rejects the next write, flush and finish", async () => {
+  const { server, client, conn, sconn } = await directPair();
+  try {
+    const { local, peer } = await openedStream(conn, sconn);
+    await peer.recv.stop(7);
+    // The first writes after the stop may still settle: they were queued before it arrived.
+    await within(writeUntilStopped(local.send), 2000, "writer observing stop");
+    await assert.rejects(local.send.write(Buffer.from("more")), /7/);
+    await assert.rejects(local.send.writeMany([Buffer.from("more")]), /7/);
+    await assert.rejects(local.send.flush(), /7/);
+    await assert.rejects(local.send.finish(), /7/);
+    await assertConnectionUsable(conn, sconn);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("flush on an idle stream resolves; writes after finish or reset reject", async () => {
+  const { server, client, conn, sconn } = await directPair();
+  try {
+    const first = await openedStream(conn, sconn);
+    await first.local.send.flush();
+    await first.local.send.write(Buffer.alloc(0));
+    const finished = first.local.send.finish();
+    // Refused from the moment finish is called, not only once the FIN is out.
+    await assert.rejects(first.local.send.write(Buffer.from("late")), /closed stream/);
+    await finished;
+    await assert.rejects(first.local.send.finish(), /closed stream/);
+    await first.local.send.flush();
+    assert.equal(await first.peer.recv.read(16), null);
+
+    const second = await openedStream(conn, sconn);
+    await second.local.send.reset(9);
+    await assert.rejects(second.local.send.write(Buffer.from("late")), /reset/);
+    await assert.rejects(second.local.send.flush(), /reset/);
+    await assert.rejects(second.local.send.finish(), /reset/);
+    await assert.rejects(second.local.send.reset(9), /closed stream/);
+    await assert.rejects(drain(second.peer.recv), /9/);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("a write that is never awaited or finished is still delivered", async () => {
+  const { server, client, conn, sconn } = await directPair();
+  try {
+    const accepted = sconn.acceptBi();
+    const payload = crypto.randomBytes(300_000);
+    const { send } = await conn.openBi();
+    void send.write(payload);
+    const peer = await accepted;
+    const got = await within(readExactly(peer.recv, payload.length), 5000, "peer read");
+    assert.ok(got.equals(payload));
   } finally {
     await client.close();
     await server.close();
