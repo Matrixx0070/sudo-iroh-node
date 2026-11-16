@@ -170,7 +170,8 @@ test("stream reset code is visible to the reader", async () => {
     const { recv } = await peerStream;
     assert.equal((await recv.read(1)).toString(), "x");
     await send.reset(3);
-    await assert.rejects(recv.read(16), /3/);
+    // The exact text is part of the contract: callers parse the code out of it.
+    await assert.rejects(recv.read(16), /^Error: stream reset by peer: error 3$/);
   } finally {
     await client.close();
     await server.close();
@@ -229,7 +230,7 @@ test("reset abandons a write the peer never reads", async () => {
     const pending = assert.rejects(local.send.write(Buffer.alloc(64 << 20)), /reset/);
     await within(local.send.reset(5), 2000, "reset");
     await pending;
-    await assert.rejects(within(drain(peer.recv), 2000, "peer read"), /5/);
+    await assert.rejects(within(drain(peer.recv), 2000, "peer read"), /reset by peer: error 5$/);
     await assertConnectionUsable(conn, sconn);
   } finally {
     await client.close();
@@ -407,7 +408,7 @@ test("a failed write rejects the next write, flush and finish", async () => {
     await peer.recv.stop(7);
     // The first writes after the stop may still settle: they were queued before it arrived.
     await within(writeUntilStopped(local.send), 2000, "writer observing stop");
-    await assert.rejects(local.send.write(Buffer.from("more")), /7/);
+    await assert.rejects(local.send.write(Buffer.from("more")), /^Error: sending stopped by peer: error 7$/);
     await assert.rejects(local.send.writeMany([Buffer.from("more")]), /7/);
     await assert.rejects(local.send.flush(), /7/);
     await assert.rejects(local.send.finish(), /7/);

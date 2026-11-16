@@ -1,0 +1,29 @@
+{
+  "name": "@sudo-ai/iroh-node-darwin-x64",
+  "version": "0.1.0",
+  "cpu": [
+    "x64"
+  ],
+  "main": "iroh-node.darwin-x64.node",
+  "files": [
+    "iroh-node.darwin-x64.node",
+    "LICENSE",
+    "THIRD-PARTY-NOTICES.md"
+  ],
+  "description": "Node.js binding for iroh endpoints and streams with Buffer-based I/O",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Matrixx0070/sudo-iroh-node.git"
+  },
+  "os": [
+    "darwin"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  }
+}

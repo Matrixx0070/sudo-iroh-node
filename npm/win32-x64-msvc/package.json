@@ -1,0 +1,29 @@
+{
+  "name": "@sudo-ai/iroh-node-win32-x64-msvc",
+  "version": "0.1.0",
+  "cpu": [
+    "x64"
+  ],
+  "main": "iroh-node.win32-x64-msvc.node",
+  "files": [
+    "iroh-node.win32-x64-msvc.node",
+    "LICENSE",
+    "THIRD-PARTY-NOTICES.md"
+  ],
+  "description": "Node.js binding for iroh endpoints and streams with Buffer-based I/O",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Matrixx0070/sudo-iroh-node.git"
+  },
+  "os": [
+    "win32"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  }
+}

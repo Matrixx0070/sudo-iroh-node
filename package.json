@@ -3,6 +3,13 @@
   "version": "0.1.0",
   "description": "Node.js binding for iroh endpoints and streams with Buffer-based I/O",
   "license": "MIT",
+  "keywords": [
+    "iroh",
+    "quic",
+    "p2p",
+    "napi-rs",
+    "node-addon"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Matrixx0070/sudo-iroh-node.git"
@@ -12,22 +19,38 @@
   "files": [
     "index.js",
     "index.d.ts",
+    "iroh-node.*.node",
     "LICENSE",
     "THIRD-PARTY-NOTICES.md",
     "README.md"
   ],
   "scripts": {
-    "build": "napi build --platform --release --strip",
+    "build": "napi build --platform --release",
+    "build:fast": "napi build --platform --profile fast",
     "build:debug": "napi build --platform",
     "test": "node --test test/*.test.cjs",
     "bench": "IROH_NODE_BENCH=1 node --test test/throughput.test.cjs",
-    "build:fast": "napi build --platform --profile fast"
+    "artifacts": "napi artifacts",
+    "version": "napi version && node scripts/sync-versions.cjs && git add npm package.json Cargo.toml Cargo.lock index.js"
+  },
+  "optionalDependencies": {
+    "@sudo-ai/iroh-node-linux-x64-gnu": "0.1.0",
+    "@sudo-ai/iroh-node-linux-x64-musl": "0.1.0",
+    "@sudo-ai/iroh-node-linux-arm64-gnu": "0.1.0",
+    "@sudo-ai/iroh-node-linux-arm64-musl": "0.1.0",
+    "@sudo-ai/iroh-node-darwin-arm64": "0.1.0",
+    "@sudo-ai/iroh-node-darwin-x64": "0.1.0",
+    "@sudo-ai/iroh-node-win32-x64-msvc": "0.1.0"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.10.9"
   },
   "engines": {
     "node": ">=22"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
   },
   "napi": {
     "binaryName": "iroh-node",
