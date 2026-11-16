@@ -23,23 +23,38 @@ The platform package manifests live in `npm/<platform>/package.json` (generated 
 
 ## CI (`.github/workflows/build.yml`)
 
-On every push to `main` and every pull request:
+On every push to `main` and every pull request, the **build** job runs once per target (seven jobs):
 
-1. **build**: seven jobs, one per target. macOS and Windows build natively. linux-x64-gnu uses
-   `--use-napi-cross` (the napi-rs cross toolchain, glibc 2.17 baseline). The musl targets and
-   linux-arm64-gnu use `-x` (cargo-zigbuild); arm64 glibc is pinned to the same baseline with the target
-   spelling `aarch64-unknown-linux-gnu.2.17`. It does not use `--use-napi-cross` because that toolchain's
-   gcc cannot assemble ring's aarch64 sources. Each job uploads its `.node` as the artifact
-   `bindings-<target>`.
-2. **test**: runs `npm test` against the built binary on linux-x64 (glibc), linux-arm64 (glibc),
-   darwin-arm64 and win32-x64. The tests need nothing from npm. The compat tests against `@number0/iroh`
-   skip themselves there.
+| target | runner | how it is built | tested in the job |
+|---|---|---|---|
+| linux-x64-gnu | `ubuntu-latest` | `--use-napi-cross` (napi-rs cross toolchain, glibc 2.17) | yes |
+| linux-x64-musl | `ubuntu-latest` | `-x` (cargo-zigbuild) | yes, in `node:24-alpine` |
+| linux-arm64-gnu | `ubuntu-24.04-arm` | `-x`, target `aarch64-unknown-linux-gnu.2.17` (glibc 2.17) | yes |
+| linux-arm64-musl | `ubuntu-24.04-arm` | `-x` (cargo-zigbuild) | yes, in `node:24-alpine` |
+| darwin-x64 | `macos-15-intel` | native | yes |
+| darwin-arm64 | `macos-15-intel` | native toolchain, arm64 target | no: by the job `test-darwin-arm64` on `macos-latest` |
+| win32-x64-msvc | `windows-latest` | native | yes |
 
-On a `v*` tag, additionally:
+Each job builds, runs `npm test` against what it built, and uploads the `.node` as the artifact
+`bindings-<target>`. The tests need nothing from npm; the compat tests against `@number0/iroh` skip
+themselves there. linux-arm64-gnu does not use `--use-napi-cross` because that toolchain's gcc cannot
+assemble ring's aarch64 sources ("ARM assembler must define __ARM_ARCH").
 
-3. **publish**: downloads all artifacts, moves each into its `npm/<platform>/` directory
-   (`napi artifacts`), copies the license files next to it, runs `scripts/check-release.cjs <tag>`, then
-   runs `npm publish --provenance --access public` for the seven platform packages and last for the loader.
+Build and test share a job on purpose: with a separate test job behind the whole matrix, one platform
+without a free runner keeps every other platform's tests from starting.
+
+Both macOS targets build on the Intel image because jobs for GitHub's arm64 macOS runners
+(`macos-latest`, `macos-15`, `macos-26`) were not assigned a runner when this was set up (cancelled by
+GitHub after 15 minutes in the queue, three runs in a row), while `macos-15-intel` jobs start. The job
+**test-darwin-arm64** downloads the cross-compiled arm64 binary and runs the tests on `macos-latest`.
+GitHub has announced the end of the Intel image for August 2027; before then, move both rows to
+`macos-latest` (build and test darwin-arm64 there, cross-compile darwin-x64).
+
+On a `v*` tag, additionally, after all seven build jobs and `test-darwin-arm64` are green:
+
+- **publish**: downloads all artifacts, moves each into its `npm/<platform>/` directory
+  (`napi artifacts`), copies the license files next to it, runs `scripts/check-release.cjs <tag>`, then
+  runs `npm publish --provenance --access public` for the seven platform packages and last for the loader.
 
 `scripts/check-release.cjs` refuses the release unless the tag, `package.json`, `index.js`, `Cargo.toml`,
 every `npm/*/package.json` and every `optionalDependencies` entry carry the same version, every platform package
@@ -65,7 +80,8 @@ git push origin main --follow-tags
 `npm version` runs the `version` script, which stamps the new version into the platform packages
 (`napi version`), the loader's `optionalDependencies`, `Cargo.toml`, `Cargo.lock` and the version check
 inside the generated `index.js` (`scripts/sync-versions.cjs`), and adds those files to the version commit. The pushed tag `v0.2.0` starts
-the workflow; nothing is published before every build and every test job is green.
+the workflow; nothing is published before all seven build jobs (tests included) and `test-darwin-arm64`
+are green.
 
 A prerelease version (`npm version 0.2.0-rc.1`) is published under the dist-tag `next` instead of
 `latest`.
@@ -88,11 +104,28 @@ includes it. A `file:` dependency on this directory therefore works on the machi
 
 That is how SUDO-AI consumes the package until it is published.
 
-## What is not verified yet
+## What is verified, and what is not
+
+Verified by CI run 43946100806 (commit 9344a9a):
+
+- All seven targets build.
+- The 24 binding tests pass on six of them: linux x64 and arm64 (glibc, and musl in Alpine), win32-x64,
+  darwin-x64.
+- The glibc binaries need at most glibc 2.17 (arm64) and 2.14 (x64).
+
+Verified on the development machine with the seven artifacts of that run: `napi artifacts`, the release
+check for `v0.1.0`, `npm pack` of all eight packages, and an install of the packed loader plus the packed
+linux-x64-gnu package into an empty project, where `require("@sudo-ai/iroh-node")` loads the binary from
+the platform package.
+
+Not verified:
 
 - **Nothing has been published.** No npm token was available when this was set up; the publish job has
-  never run. Its steps were rehearsed locally up to the `npm publish` call (`napi artifacts`, the release
-  check, `npm pack --dry-run` of the loader and of a platform package).
-- The cross-compiled targets (linux arm64 glibc/musl, linux x64 musl, both macOS targets, Windows) were
-  never built on the development machine, only by the workflow. Of those, only darwin-arm64 and win32-x64
-  are also executed by the test jobs; linux musl, linux arm64 and darwin-x64 binaries are built but not run.
+  never run, so `npm publish --provenance` itself is untested.
+- **darwin-arm64 is built but has never been executed.** The job `test-darwin-arm64` was cancelled by
+  GitHub after 15 minutes without a runner ("The job was not acquired by Runner of type hosted even after
+  multiple attempts"), like every arm64 macOS job of this repository so far. The run therefore shows as
+  failed, and a tag would not publish. Re-run it with
+  `gh run rerun <run id> --failed --repo Matrixx0070/sudo-iroh-node`. If arm64 macOS runners stay
+  unavailable and a release has to go out, removing `test-darwin-arm64` from the publish job's `needs` is
+  the deliberate way to ship that one binary untested.

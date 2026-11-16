@@ -146,6 +146,9 @@ for the platform. Both run iroh 1.4.1, so the two sides of a tunnel may use diff
 Everything above the adapter sees the same interface either way: `Buffer` payloads, numeric close and reset
 codes, hex endpoint ids.
 
+Measured through the whole tunnel (HTTP over the mux, gateway child in its own process, direct loopback):
+137 MB/s down and 131 MB/s up with this binding, 4.5 MB/s with `@number0/iroh`.
+
 ## Development
 
 ```bash
