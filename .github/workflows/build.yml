@@ -1,5 +1,5 @@
 # Builds the addon for every published platform and runs the binding tests in the same job wherever
-# the runner can execute what it built (darwin-arm64 is tested by a job of its own). On a `v*` tag it then
+# the runner can execute what it built (darwin-arm64 is cross-compiled only: no hosted Apple Silicon runner is available to this account). On a `v*` tag it then
 # publishes the loader and the platform packages to npm. Based on the napi-rs package template
 # (https://github.com/napi-rs/package-template); build and test share a job so that one platform
 # without free runners cannot hold back the test results of the others.
@@ -16,7 +16,6 @@ env:
     tags:
       - v*
   pull_request: null
-  workflow_dispatch: null
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
@@ -51,7 +50,7 @@ jobs:
             test: docker run --rm -v "$PWD:/work" -w /work node:24-alpine npm test
           # Both macOS targets build on the Intel image: when this was set up, jobs for the arm64 macOS
           # runners (macos-latest, macos-15, macos-26) were never assigned a runner. The arm64 binary
-          # is cross-compiled here and tested by the test-darwin-arm64 job below.
+          # is cross-compiled here; no hosted Apple Silicon runner is available to this account for a load test.
           - host: macos-15-intel
             target: x86_64-apple-darwin
             build: npm run build -- --target x86_64-apple-darwin
@@ -119,58 +118,12 @@ jobs:
           path: ${{ env.APP_NAME }}.*.node
           if-no-files-found: error
 
-  # Hosted Apple Silicon runners are not available to this account ("configuration macos-14-arm64 is not
-  # supported"; macos-latest never acquired). The darwin-arm64 binary is still built and shipped: its build is
-  # verified above and the identical codebase passes the load test on x86_64-apple-darwin. This job therefore runs
-  # only on manual dispatch (workflow_dispatch) so it can be re-tried when a runner becomes available, and publish
-  # treats a skipped job as "not failed" (see `outputs.result`).
-  test-darwin-arm64:
-    name: test aarch64-apple-darwin
-    if: ${{ github.event_name == 'workflow_dispatch' }}
-    needs:
-      - build
-    runs-on: macos-latest
-    continue-on-error: true
-    timeout-minutes: 30
-    outputs:
-      result: ${{ steps.verdict.outputs.result }}
-    steps:
-      - uses: actions/checkout@v7
-      - name: Setup node
-        uses: actions/setup-node@v7
-        with:
-          node-version: 24
-      - name: Download artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: bindings-aarch64-apple-darwin
-          path: .
-      - name: Runner is Apple Silicon
-        id: arch
-        run: |
-          echo "arch=$(uname -m)" >> "$GITHUB_OUTPUT"
-          uname -m
-      - name: Test bindings
-        id: test
-        if: ${{ steps.arch.outputs.arch == 'arm64' }}
-        run: npm test
-      - name: Verdict
-        id: verdict
-        if: ${{ always() }}
-        run: |
-          if [ "${{ steps.arch.outputs.arch }}" != "arm64" ]; then echo "result=no-arm64-runner" >> "$GITHUB_OUTPUT"
-          elif [ "${{ steps.test.outcome }}" = "success" ]; then echo "result=passed" >> "$GITHUB_OUTPUT"
-          else echo "result=failed" >> "$GITHUB_OUTPUT"; fi
-          cat "$GITHUB_OUTPUT"
-
   publish:
     name: publish to npm
-    # Runs on a tag once every build is green. The darwin-arm64 test may have been skipped for lack of a runner
-    # (result empty or no-arm64-runner) — that is allowed; a real failure (result=failed) blocks the release.
-    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && needs.build.result == 'success' && needs.test-darwin-arm64.outputs.result != 'failed' }}
+    # Runs on a tag once every build is green.
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && needs.build.result == 'success' }}
     needs:
       - build
-      - test-darwin-arm64
     runs-on: ubuntu-latest
     permissions:
       contents: read
