@@ -15,24 +15,34 @@ const { ALPN, serveEndpoint, echo } = require("./support/proto.cjs");
 const API = {
   Endpoint: [
     "accept",
+    "acceptIncoming",
+    "addExternalAddr",
     "boundSockets",
     "close",
     "connect",
     "homeRelayStatus",
     "id",
     "online",
+    "removeExternalAddr",
     "watchHomeRelay",
   ],
+  Incoming: ["complete", "pathKind", "refuse", "remoteAddr"],
   HomeRelayWatcher: ["next"],
   Connection: [
     "acceptBi",
+    "alpn",
     "close",
     "closed",
+    "directRemoteAddr",
+    "maxDatagramSize",
     "openBi",
     "pathKind",
+    "readDatagram",
     "remoteId",
     "rttMs",
+    "sendDatagram",
     "setMaxConcurrentBiStreams",
+    "stats",
   ],
   SendStream: ["finish", "flush", "reset", "write", "writeMany"],
   RecvStream: ["read", "stop"],
@@ -448,5 +458,122 @@ test("a write that is never awaited or finished is still delivered", async () =>
   } finally {
     await client.close();
     await server.close();
+  }
+});
+
+test("acceptIncoming shows the source before the handshake and completes it", async () => {
+  const server = await binding.bind({ secretKey: crypto.randomBytes(32), alpns: [ALPN] });
+  const client = await binding.bind({ secretKey: crypto.randomBytes(32) });
+  try {
+    const next = server.acceptIncoming();
+    const dialing = client.connect(server.id(), ALPN, {
+      directAddrs: loopbackAddrs(server.boundSockets()),
+    });
+    const incoming = await within(next, 5000, "incoming");
+    assert.equal(incoming.pathKind(), "direct");
+    const clientPorts = client.boundSockets().map((a) => a.slice(a.lastIndexOf(":") + 1));
+    const from = incoming.remoteAddr();
+    assert.ok(clientPorts.includes(from.slice(from.lastIndexOf(":") + 1)), from);
+    const sconn = await incoming.complete();
+    const conn = await dialing;
+    assert.equal(sconn.remoteId(), client.id());
+    assert.deepEqual(sconn.alpn(), ALPN);
+    assert.deepEqual(conn.alpn(), ALPN);
+    // Used up: no second handshake, no refusal after the fact.
+    assert.equal(incoming.pathKind(), "none");
+    assert.equal(incoming.remoteAddr(), null);
+    await assert.rejects(incoming.complete(), /already completed or refused/);
+    assert.throws(() => incoming.refuse(), /already completed or refused/);
+    await assertConnectionUsable(conn, sconn);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("a refused incoming connection fails the dial and the next one is served", async () => {
+  const server = await binding.bind({ secretKey: crypto.randomBytes(32), alpns: [ALPN] });
+  const client = await binding.bind({ secretKey: crypto.randomBytes(32) });
+  try {
+    const directAddrs = loopbackAddrs(server.boundSockets());
+    const refused = assert.rejects(client.connect(server.id(), ALPN, { directAddrs }));
+    (await within(server.acceptIncoming(), 5000, "incoming")).refuse();
+    await within(refused, 5000, "refused dial");
+    const dialing = client.connect(server.id(), ALPN, { directAddrs });
+    const sconn = await (await within(server.acceptIncoming(), 5000, "incoming")).complete();
+    await assertConnectionUsable(await dialing, sconn);
+    // A closed endpoint ends the accept loop.
+    const last = server.acceptIncoming();
+    await server.close();
+    assert.equal(await within(last, 5000, "accept after close"), null);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("datagrams cross as Buffers; oversized ones are refused", async () => {
+  const { server, client, conn, sconn } = await directPair();
+  try {
+    const max = conn.maxDatagramSize();
+    assert.ok(max >= 1000 && max < 65536, `max datagram size ${max}`);
+    const next = sconn.readDatagram();
+    const sent = crypto.randomBytes(900);
+    conn.sendDatagram(sent);
+    const got = await within(next, 5000, "datagram");
+    assert.ok(Buffer.isBuffer(got));
+    assert.ok(got.equals(sent));
+    // The limit follows path MTU discovery, so only a size far beyond any MTU is a sure refusal.
+    assert.throws(() => conn.sendDatagram(Buffer.alloc(16_384)), /too large/i);
+    // A pending read ends with the connection instead of hanging.
+    const pending = assert.rejects(sconn.readDatagram());
+    conn.close(0, "done");
+    await within(pending, 5000, "datagram read after close");
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("stats count traffic and directRemoteAddr names the peer's socket", async () => {
+  const { server, client, conn, sconn } = await directPair();
+  try {
+    const { local, peer } = await openedStream(conn, sconn);
+    await local.send.write(Buffer.alloc(200_000, 1));
+    await local.send.finish();
+    assert.equal((await readExactly(peer.recv, 200_000)).length, 200_000);
+    const rx = sconn.stats();
+    const tx = conn.stats();
+    assert.ok(rx.udpRxBytes >= 200_000, `server received ${rx.udpRxBytes} bytes`);
+    assert.ok(tx.udpTxBytes >= 200_000, `client sent ${tx.udpTxBytes} bytes`);
+    assert.ok(rx.udpRxDatagrams > 100 && tx.udpTxDatagrams > 100);
+    assert.equal(typeof tx.lostPackets, "number");
+    const serverPorts = server.boundSockets().map((a) => a.slice(a.lastIndexOf(":") + 1));
+    const remote = conn.directRemoteAddr();
+    assert.ok(serverPorts.includes(remote.slice(remote.lastIndexOf(":") + 1)), remote);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("external addresses can be added and removed; a relay token is accepted", async () => {
+  const endpoint = await binding.bind({
+    secretKey: crypto.randomBytes(32),
+    // Nothing listens there: the endpoint binds and simply never gets online.
+    relayUrl: "https://127.0.0.1:9",
+    relayToken: "secret",
+  });
+  try {
+    await endpoint.addExternalAddr("203.0.113.7:4444");
+    assert.equal(await endpoint.removeExternalAddr("203.0.113.7:4444"), true);
+    assert.equal(await endpoint.removeExternalAddr("203.0.113.7:4444"), false);
+    await assert.rejects(endpoint.addExternalAddr("not an address"), /invalid/i);
+    assert.deepEqual(
+      endpoint.homeRelayStatus().map((r) => r.connected),
+      endpoint.homeRelayStatus().map(() => false),
+    );
+  } finally {
+    await endpoint.close();
   }
 });

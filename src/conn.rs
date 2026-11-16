@@ -1,6 +1,10 @@
 //! Connections: admission identity, stream open/accept, close with code + reason.
 
-use iroh::endpoint::{self, ConnectionError, VarInt};
+use bytes::Bytes;
+use iroh::{
+    TransportAddr,
+    endpoint::{self, ConnectionError, VarInt},
+};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
@@ -18,6 +22,21 @@ pub struct CloseInfo {
     pub reason: String,
     /// "application", "locally_closed", "timed_out", "reset" or "transport".
     pub kind: String,
+}
+
+/// Traffic counters of a connection, summed over all its paths.
+#[napi(object)]
+pub struct ConnectionStats {
+    /// Bytes received in UDP datagrams (QUIC overhead included).
+    pub udp_rx_bytes: f64,
+    /// Bytes sent in UDP datagrams (QUIC overhead included).
+    pub udp_tx_bytes: f64,
+    /// UDP datagrams received.
+    pub udp_rx_datagrams: f64,
+    /// UDP datagrams sent.
+    pub udp_tx_datagrams: f64,
+    /// QUIC packets declared lost.
+    pub lost_packets: f64,
 }
 
 /// An established QUIC connection.
@@ -58,6 +77,12 @@ impl Connection {
     #[napi]
     pub fn remote_id(&self) -> String {
         self.0.remote_id().to_string()
+    }
+
+    /// The ALPN protocol the handshake agreed on.
+    #[napi]
+    pub fn alpn(&self) -> Buffer {
+        self.0.alpn().to_vec().into()
     }
 
     /// Opens a bidirectional stream.
@@ -105,6 +130,53 @@ impl Connection {
             Some(p) if p.is_relay() => "relay".into(),
             _ => "none".into(),
         }
+    }
+
+    /// Remote socket address (`host:port`) of the selected path when it is direct, else null.
+    #[napi]
+    pub fn direct_remote_addr(&self) -> Option<String> {
+        let paths = self.0.paths();
+        let selected = paths.iter().find(|p| p.is_selected())?;
+        match selected.remote_addr() {
+            TransportAddr::Ip(addr) => Some(addr.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Traffic counters since the connection was established.
+    #[napi]
+    pub fn stats(&self) -> ConnectionStats {
+        let s = self.0.stats();
+        ConnectionStats {
+            udp_rx_bytes: s.udp_rx.bytes as f64,
+            udp_tx_bytes: s.udp_tx.bytes as f64,
+            udp_rx_datagrams: s.udp_rx.datagrams as f64,
+            udp_tx_datagrams: s.udp_tx.datagrams as f64,
+            lost_packets: s.lost_packets as f64,
+        }
+    }
+
+    /// Largest payload `sendDatagram` takes right now, or null if the peer does not accept
+    /// datagrams.
+    #[napi]
+    pub fn max_datagram_size(&self) -> Option<u32> {
+        self.0.max_datagram_size().map(|n| n as u32)
+    }
+
+    /// Sends an unreliable datagram (one copy). Throws if it is too large, the peer does not
+    /// accept datagrams or the connection is closed.
+    #[napi]
+    pub fn send_datagram(&self, data: &[u8]) -> Result<()> {
+        self.0
+            .send_datagram(Bytes::copy_from_slice(data))
+            .map_err(js_err)
+    }
+
+    /// Resolves with the next received datagram; rejects once the connection is closed.
+    #[napi]
+    pub async fn read_datagram(&self) -> Result<Buffer> {
+        let datagram = self.0.read_datagram().await.map_err(js_err)?;
+        Ok(Vec::from(datagram).into())
     }
 
     /// Round-trip time of the selected path in milliseconds, if known.

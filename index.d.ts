@@ -13,6 +13,8 @@ export declare const __napiBindingTarget: 'native' | 'wasm32-wasi' | 'wasm32-was
 export declare class Connection {
   /** Remote endpoint id (lowercase hex), authenticated by the TLS handshake. */
   remoteId(): string
+  /** The ALPN protocol the handshake agreed on. */
+  alpn(): Buffer
   /** Opens a bidirectional stream. */
   openBi(): Promise<{ send: SendStream, recv: RecvStream }>
   /** Accepts the next peer-opened bidirectional stream; rejects once the connection is closed. */
@@ -25,6 +27,22 @@ export declare class Connection {
   closed(): Promise<CloseInfo>
   /** "direct" if the selected path is UDP, "relay" if it goes through the relay, else "none". */
   pathKind(): string
+  /** Remote socket address (`host:port`) of the selected path when it is direct, else null. */
+  directRemoteAddr(): string | null
+  /** Traffic counters since the connection was established. */
+  stats(): ConnectionStats
+  /**
+   * Largest payload `sendDatagram` takes right now, or null if the peer does not accept
+   * datagrams.
+   */
+  maxDatagramSize(): number | null
+  /**
+   * Sends an unreliable datagram (one copy). Throws if it is too large, the peer does not
+   * accept datagrams or the connection is closed.
+   */
+  sendDatagram(data: Uint8Array): void
+  /** Resolves with the next received datagram; rejects once the connection is closed. */
+  readDatagram(): Promise<Buffer>
   /** Round-trip time of the selected path in milliseconds, if known. */
   rttMs(): number | null
 }
@@ -46,6 +64,19 @@ export declare class Endpoint {
    * Resolves null once the endpoint is closed. A failed handshake rejects; call again.
    */
   accept(): Promise<Connection | null>
+  /**
+   * Waits for the next incoming connection without running its handshake, so the caller can
+   * accept the following one while this one completes, or refuse it by its source.
+   * Resolves null once the endpoint is closed.
+   */
+  acceptIncoming(): Promise<Incoming | null>
+  /**
+   * Advertises an address (`host:port`) this endpoint is reachable at, e.g. a public address
+   * learned from outside. Peers try it as a direct path.
+   */
+  addExternalAddr(addr: string): Promise<void>
+  /** Stops advertising an address added with `addExternalAddr`; false if it was not there. */
+  removeExternalAddr(addr: string): Promise<boolean>
   /** Dials `endpointId` (hex) on `alpn`, via the given relay and/or direct addresses. */
   connect(endpointId: string, alpn: Uint8Array, opts?: ConnectOptions | undefined | null): Promise<Connection>
   /** Closes all connections and the endpoint. */
@@ -61,18 +92,43 @@ export declare class HomeRelayWatcher {
   next(): Promise<Array<HomeRelayStatus> | null>
 }
 
+/**
+ * An incoming connection whose handshake has not run yet: look at where it comes from, then
+ * `complete` or `refuse` it. Each can be called once.
+ */
+export declare class Incoming {
+  /**
+   * "direct" for a UDP packet from an IP address, "relay" via the relay, else "none"
+   * (also once the connection was completed or refused).
+   */
+  pathKind(): string
+  /**
+   * Remote socket address (`host:port`) of a direct incoming connection, else null. Not
+   * authenticated: the peer has not proven it owns this address or any endpoint id yet.
+   */
+  remoteAddr(): string | null
+  /** Runs the handshake. Rejects if it fails. */
+  complete(): Promise<Connection>
+  /** Refuses the connection (the peer sees CONNECTION_REFUSED) without running the handshake. */
+  refuse(): void
+}
+
 /** Receiving half of a bidirectional stream. */
 export declare class RecvStream {
   /**
-   * Reads whatever is available (at least 1 byte, at most `max`, which is clamped to 4 MiB),
-   * gathering every chunk QUIC has already received so one JS call covers many packets;
-   * resolves null at end of stream. Rejects if the peer reset the stream (message contains the
-   * reset code).
+   * Reads whatever has arrived (at least 1 byte, at most `max`, which is clamped to 4 MiB) as
+   * one Buffer covering many packets; waits only if nothing has arrived yet. Resolves null at
+   * end of stream. Rejects if the peer reset the stream (message contains the reset code),
+   * after the bytes received before the reset have been read.
+   *
+   * About 1 MiB per stream is taken from QUIC ahead of the reads; a slower reader holds the
+   * peer back through QUIC flow control.
    */
   read(max: number): Promise<Buffer | null>
   /**
-   * Asks the peer to stop sending, with an application error code. A pending read rejects
-   * first, so STOP_SENDING is not held up by a peer that stays silent.
+   * Asks the peer to stop sending, with an application error code. Pending and later reads
+   * reject and unread bytes are dropped, so STOP_SENDING is not held up by a peer that stays
+   * silent.
    */
   stop(code: number): Promise<void>
 }
@@ -115,6 +171,8 @@ export interface BindOptions {
   secretKey: Uint8Array
   /** The only relay in the relay map; omitted means relays disabled. */
   relayUrl?: string
+  /** Bearer token sent to the relay when attaching to it (relay-side admission). */
+  relayToken?: string
   /** ALPNs this endpoint accepts (needed only to accept connections). */
   alpns?: Array<Uint8Array>
   /** Local UDP socket address (`host:port`); default is iroh's default. */
@@ -133,6 +191,20 @@ export interface CloseInfo {
   reason: string
   /** "application", "locally_closed", "timed_out", "reset" or "transport". */
   kind: string
+}
+
+/** Traffic counters of a connection, summed over all its paths. */
+export interface ConnectionStats {
+  /** Bytes received in UDP datagrams (QUIC overhead included). */
+  udpRxBytes: number
+  /** Bytes sent in UDP datagrams (QUIC overhead included). */
+  udpTxBytes: number
+  /** UDP datagrams received. */
+  udpRxDatagrams: number
+  /** UDP datagrams sent. */
+  udpTxDatagrams: number
+  /** QUIC packets declared lost. */
+  lostPackets: number
 }
 
 /** Options for `Endpoint.connect`. */

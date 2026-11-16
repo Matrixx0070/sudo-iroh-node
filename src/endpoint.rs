@@ -3,8 +3,9 @@
 use std::{str::FromStr, sync::Arc, time::Duration};
 
 use iroh::{
-    Endpoint as IrohEndpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, Watcher,
-    endpoint::{QuicTransportConfig, RelayStatus, presets},
+    Endpoint as IrohEndpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
+    Watcher,
+    endpoint::{self, IncomingAddr, QuicTransportConfig, RelayStatus, presets},
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -19,6 +20,8 @@ pub struct BindOptions {
     pub secret_key: Uint8Array,
     /// The only relay in the relay map; omitted means relays disabled.
     pub relay_url: Option<String>,
+    /// Bearer token sent to the relay when attaching to it (relay-side admission).
+    pub relay_token: Option<String>,
     /// ALPNs this endpoint accepts (needed only to accept connections).
     pub alpns: Option<Vec<Uint8Array>>,
     /// Local UDP socket address (`host:port`); default is iroh's default.
@@ -38,7 +41,13 @@ pub async fn bind(opts: BindOptions) -> Result<Endpoint> {
         .try_into()
         .map_err(|_| js_err("secretKey must be 32 bytes"))?;
     let relay = match opts.relay_url {
-        Some(u) => RelayMode::custom([RelayUrl::from_str(&u).map_err(js_err)?]),
+        Some(u) => {
+            let map = RelayMap::from_iter([RelayUrl::from_str(&u).map_err(js_err)?]);
+            RelayMode::Custom(match opts.relay_token {
+                Some(token) => map.with_auth_token(token),
+                None => map,
+            })
+        }
         None => RelayMode::Disabled,
     };
     let alpns = opts
@@ -123,6 +132,66 @@ impl HomeRelayWatcher {
     }
 }
 
+/// An incoming connection whose handshake has not run yet: look at where it comes from, then
+/// `complete` or `refuse` it. Each can be called once.
+#[napi]
+pub struct Incoming(std::sync::Mutex<Option<endpoint::Incoming>>);
+
+impl Incoming {
+    fn take(&self) -> Result<endpoint::Incoming> {
+        let taken = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+        taken.ok_or_else(|| js_err("incoming connection already completed or refused"))
+    }
+
+    fn addr(&self) -> Option<IncomingAddr> {
+        let incoming = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        incoming.as_ref().map(|i| i.remote_addr())
+    }
+}
+
+#[napi]
+impl Incoming {
+    /// "direct" for a UDP packet from an IP address, "relay" via the relay, else "none"
+    /// (also once the connection was completed or refused).
+    #[napi]
+    pub fn path_kind(&self) -> String {
+        match self.addr() {
+            Some(IncomingAddr::Ip(_)) => "direct".into(),
+            Some(IncomingAddr::Relay { .. }) => "relay".into(),
+            _ => "none".into(),
+        }
+    }
+
+    /// Remote socket address (`host:port`) of a direct incoming connection, else null. Not
+    /// authenticated: the peer has not proven it owns this address or any endpoint id yet.
+    #[napi]
+    pub fn remote_addr(&self) -> Option<String> {
+        match self.addr() {
+            Some(IncomingAddr::Ip(addr)) => Some(addr.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Runs the handshake. Rejects if it fails.
+    #[napi]
+    pub async fn complete(&self) -> Result<Connection> {
+        let conn = self
+            .take()?
+            .accept()
+            .map_err(js_err)?
+            .await
+            .map_err(js_err)?;
+        Ok(Connection::new(conn))
+    }
+
+    /// Refuses the connection (the peer sees CONNECTION_REFUSED) without running the handshake.
+    #[napi]
+    pub fn refuse(&self) -> Result<()> {
+        self.take()?.refuse();
+        Ok(())
+    }
+}
+
 /// A bound iroh endpoint.
 #[napi]
 pub struct Endpoint(Arc<IrohEndpoint>);
@@ -182,6 +251,31 @@ impl Endpoint {
         };
         let conn = incoming.accept().map_err(js_err)?.await.map_err(js_err)?;
         Ok(Some(Connection::new(conn)))
+    }
+
+    /// Waits for the next incoming connection without running its handshake, so the caller can
+    /// accept the following one while this one completes, or refuse it by its source.
+    /// Resolves null once the endpoint is closed.
+    #[napi]
+    pub async fn accept_incoming(&self) -> Option<Incoming> {
+        let incoming = self.0.accept().await?;
+        Some(Incoming(std::sync::Mutex::new(Some(incoming))))
+    }
+
+    /// Advertises an address (`host:port`) this endpoint is reachable at, e.g. a public address
+    /// learned from outside. Peers try it as a direct path.
+    #[napi]
+    pub async fn add_external_addr(&self, addr: String) -> Result<()> {
+        let addr = std::net::SocketAddr::from_str(&addr).map_err(js_err)?;
+        self.0.add_external_addr(addr).await;
+        Ok(())
+    }
+
+    /// Stops advertising an address added with `addExternalAddr`; false if it was not there.
+    #[napi]
+    pub async fn remove_external_addr(&self, addr: String) -> Result<bool> {
+        let addr = std::net::SocketAddr::from_str(&addr).map_err(js_err)?;
+        Ok(self.0.remove_external_addr(&addr).await)
     }
 
     /// Dials `endpointId` (hex) on `alpn`, via the given relay and/or direct addresses.
