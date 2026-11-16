@@ -79,9 +79,17 @@ export declare class RecvStream {
 
 /** Sending half of a bidirectional stream. */
 export declare class SendStream {
-  /** Writes all bytes; resolves when QUIC has accepted them (flow-control backpressure). */
+  /**
+   * Writes all bytes; resolves when QUIC has accepted them (flow-control backpressure). The
+   * bytes are copied before this returns, so the caller may reuse `data` right away.
+   */
   write(data: Uint8Array): Promise<void>
-  /** Ends the send side cleanly (FIN). */
+  /**
+   * Writes several buffers in order as one operation: one promise and one pass through QUIC
+   * for the whole batch. Use it when many small frames are ready at once.
+   */
+  writeMany(data: Array<Uint8Array>): Promise<void>
+  /** Ends the send side cleanly (FIN), after every write issued before it. */
   finish(): Promise<void>
   /**
    * Abandons the send side with an application error code. A pending write rejects first, so

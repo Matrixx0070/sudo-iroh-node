@@ -34,7 +34,7 @@ const API = {
     "rttMs",
     "setMaxConcurrentBiStreams",
   ],
-  SendStream: ["finish", "reset", "write"],
+  SendStream: ["finish", "reset", "write", "writeMany"],
   RecvStream: ["read", "stop"],
 };
 
@@ -244,3 +244,114 @@ async function writeUntilStopped(send) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
+
+// Reads exactly n bytes (or fewer at end of stream) with reads of at most `max` bytes.
+async function readExactly(recv, n, max = 1 << 20) {
+  const parts = [];
+  for (let left = n; left > 0;) {
+    const b = await recv.read(Math.min(left, max));
+    if (b === null) {
+      break;
+    }
+    parts.push(b);
+    left -= b.length;
+  }
+  return Buffer.concat(parts);
+}
+
+test("writes that are not awaited arrive in call order, then the FIN", async () => {
+  const { server, client, conn, sconn } = await directPair();
+  try {
+    const { local, peer } = await openedStream(conn, sconn);
+    // 8 MiB is several flow-control windows, so later writes queue behind a waiting one.
+    const frames = Array.from({ length: 2048 }, (_, i) => {
+      const f = Buffer.alloc(4096, i & 0xff);
+      f.writeUInt32BE(i, 0);
+      return f;
+    });
+    const writes = frames.map((f) => local.send.write(f));
+    const finished = local.send.finish();
+    const got = await within(readExactly(peer.recv, frames.length * 4096 + 1), 20000, "read");
+    await Promise.all(writes);
+    await finished;
+    assert.equal(got.length, frames.length * 4096);
+    assert.ok(got.equals(Buffer.concat(frames)));
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("writeMany sends a batch in order and a write may reuse its buffer at once", async () => {
+  const { server, client, conn, sconn } = await directPair();
+  try {
+    const { local, peer } = await openedStream(conn, sconn);
+    const batch = [Buffer.from("alpha"), Buffer.alloc(0), new Uint8Array([1, 2, 3]), Buffer.alloc(70000, 9)];
+    const many = local.send.writeMany(batch);
+    const scratch = Buffer.from("first");
+    const one = local.send.write(scratch);
+    scratch.fill(0x7a); // already copied: the peer still sees "first"
+    await Promise.all([many, one, local.send.writeMany([]), local.send.write(Buffer.alloc(0))]);
+    await local.send.finish();
+    const got = await within(readExactly(peer.recv, 1 << 20), 5000, "read");
+    assert.ok(got.equals(Buffer.concat([...batch, Buffer.from("first")])));
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("reads honor max, carry the remainder over and clamp oversized requests", async () => {
+  const { server, client, conn, sconn } = await directPair();
+  try {
+    const { local, peer } = await openedStream(conn, sconn);
+    const payload = crypto.randomBytes(300000);
+    await local.send.write(payload);
+    await local.send.finish();
+    const parts = [];
+    for (const max of [1, 2, 7, 1000, 0xffffffff]) {
+      const b = await within(peer.recv.read(max), 5000, "read");
+      assert.ok(b.length >= 1 && b.length <= max, `read(${max}) returned ${b.length} bytes`);
+      parts.push(b);
+    }
+    parts.push(await within(readExactly(peer.recv, payload.length), 5000, "read"));
+    assert.ok(Buffer.concat(parts).equals(payload));
+    assert.equal(await peer.recv.read(16), null);
+    await assert.rejects(peer.recv.read(0), /max must be > 0/);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("a busy stream does not starve the event loop", async () => {
+  const { server, client, conn, sconn } = await directPair();
+  try {
+    const { local, peer } = await openedStream(conn, sconn);
+    let ticks = 0;
+    const timer = setInterval(() => ticks++, 1);
+    const started = Date.now();
+    const frame = Buffer.alloc(256, 1);
+    const total = 16 << 20;
+    const writer = (async () => {
+      for (let sent = 0; sent < total; sent += frame.length) {
+        await local.send.write(frame);
+      }
+      await local.send.finish();
+    })();
+    let received = 0;
+    for (let b; (b = await peer.recv.read(4096));) {
+      received += b.length;
+    }
+    await writer;
+    clearInterval(timer);
+    const elapsedMs = Date.now() - started;
+    assert.equal(received, total);
+    // Tens of thousands of writes and reads settled on the JS thread; a 1 ms timer must have kept
+    // firing in between (about 1000 times here; about 15 if settled promises never yield).
+    assert.ok(ticks >= elapsedMs / 20, `timer ran only ${ticks} times in ${elapsedMs} ms`);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
