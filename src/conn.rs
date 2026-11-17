@@ -1,4 +1,5 @@
-//! Connections: admission identity, stream open/accept, close with code + reason.
+//! A connection: who is on the other end, its streams and datagrams, how it closes, and which path
+//! it currently takes.
 
 use bytes::Bytes;
 use iroh::{
@@ -13,23 +14,42 @@ use crate::{
     stream::{RecvStream, SendStream},
 };
 
-/// How a connection ended, as returned by `Connection.closed()`.
+/// How a connection ended; what `Connection.closed()` resolves with.
 #[napi(object)]
 pub struct CloseInfo {
-    /// Application close code, when the peer or we closed with one; otherwise null.
+    /// The application close code when either side closed with one; null otherwise.
     pub code: Option<u32>,
-    /// Application close reason (UTF-8, lossy) or the transport error text.
+    /// The application close reason (UTF-8, invalid bytes replaced), or the transport error text.
     pub reason: String,
-    /// "application", "locally_closed", "timed_out", "reset" or "transport".
+    /// One of "application", "locally_closed", "timed_out", "reset", "transport".
     pub kind: String,
 }
 
-/// Traffic counters of a connection, summed over all its paths.
+impl From<ConnectionError> for CloseInfo {
+    fn from(error: ConnectionError) -> Self {
+        if let ConnectionError::ApplicationClosed(close) = &error {
+            return Self {
+                code: Some(close.error_code.into_inner() as u32),
+                reason: String::from_utf8_lossy(&close.reason).into_owned(),
+                kind: "application".to_owned(),
+            };
+        }
+        let kind = match error {
+            ConnectionError::LocallyClosed => "locally_closed",
+            ConnectionError::TimedOut => "timed_out",
+            ConnectionError::Reset => "reset",
+            _ => "transport",
+        };
+        Self { code: None, reason: error.to_string(), kind: kind.to_owned() }
+    }
+}
+
+/// Traffic counters of a connection, over all of its paths together.
 #[napi(object)]
 pub struct ConnectionStats {
-    /// Bytes received in UDP datagrams (QUIC overhead included).
+    /// Bytes received in UDP datagrams, QUIC overhead included.
     pub udp_rx_bytes: f64,
-    /// Bytes sent in UDP datagrams (QUIC overhead included).
+    /// Bytes sent in UDP datagrams, QUIC overhead included.
     pub udp_tx_bytes: f64,
     /// UDP datagrams received.
     pub udp_rx_datagrams: f64,
@@ -44,25 +64,40 @@ pub struct ConnectionStats {
 pub struct Connection(endpoint::Connection);
 
 impl Connection {
-    pub(crate) fn new(c: endpoint::Connection) -> Self {
-        Self(c)
+    pub(crate) fn new(inner: endpoint::Connection) -> Self {
+        Self(inner)
+    }
+
+    // Applies `f` to the path the connection is using now, if any.
+    fn selected_path<T>(&self, f: impl FnOnce(endpoint::Path<'_>) -> T) -> Option<T> {
+        let paths = self.0.paths();
+        paths.iter().find(|path| path.is_selected()).map(f)
     }
 }
 
-/// Opened/accepted stream halves before they become JS objects.
-pub struct RawBi(SendStream, RecvStream);
+/// Both halves of a new stream, handed to JS as `{ send, recv }`.
+pub struct BiStream {
+    send: SendStream,
+    recv: RecvStream,
+}
 
-impl ToNapiValue for RawBi {
-    unsafe fn to_napi_value(env: sys::napi_env, v: Self) -> Result<sys::napi_value> {
-        let env_w = Env::from_raw(env);
-        let mut obj = Object::new(&env_w)?;
-        obj.set("send", v.0)?;
-        obj.set("recv", v.1)?;
-        unsafe { Object::to_napi_value(env, obj) }
+impl BiStream {
+    fn from_quic((send, recv): (endpoint::SendStream, endpoint::RecvStream)) -> Self {
+        Self { send: SendStream::new(send), recv: RecvStream::new(recv) }
     }
 }
 
-impl TypeName for RawBi {
+impl ToNapiValue for BiStream {
+    unsafe fn to_napi_value(env: sys::napi_env, value: Self) -> Result<sys::napi_value> {
+        let mut pair = Object::new(&Env::from_raw(env))?;
+        pair.set("send", value.send)?;
+        pair.set("recv", value.recv)?;
+        // SAFETY: `env` is the live environment napi handed to this conversion.
+        unsafe { Object::to_napi_value(env, pair) }
+    }
+}
+
+impl TypeName for BiStream {
     fn type_name() -> &'static str {
         "BiStream"
     }
@@ -73,139 +108,124 @@ impl TypeName for RawBi {
 
 #[napi]
 impl Connection {
-    /// Remote endpoint id (lowercase hex), authenticated by the TLS handshake.
+    /// The peer's endpoint id (lowercase hex), proven by the TLS handshake.
     #[napi]
     pub fn remote_id(&self) -> String {
         self.0.remote_id().to_string()
     }
 
-    /// The ALPN protocol the handshake agreed on.
+    /// The ALPN protocol both sides agreed on.
     #[napi]
     pub fn alpn(&self) -> Buffer {
-        self.0.alpn().to_vec().into()
+        Buffer::from(self.0.alpn().to_vec())
     }
 
     /// Opens a bidirectional stream.
     #[napi(ts_return_type = "Promise<{ send: SendStream, recv: RecvStream }>")]
-    pub async fn open_bi(&self) -> Result<RawBi> {
-        let (s, r) = self.0.open_bi().await.map_err(js_err)?;
-        Ok(RawBi(SendStream::new(s), RecvStream::new(r)))
+    pub async fn open_bi(&self) -> Result<BiStream> {
+        let halves = self.0.open_bi().await.map_err(js_err)?;
+        Ok(BiStream::from_quic(halves))
     }
 
-    /// Accepts the next peer-opened bidirectional stream; rejects once the connection is closed.
+    /// Takes the next bidirectional stream the peer opened; rejects once the connection is closed.
     #[napi(ts_return_type = "Promise<{ send: SendStream, recv: RecvStream }>")]
-    pub async fn accept_bi(&self) -> Result<RawBi> {
-        let (s, r) = self.0.accept_bi().await.map_err(js_err)?;
-        Ok(RawBi(SendStream::new(s), RecvStream::new(r)))
+    pub async fn accept_bi(&self) -> Result<BiStream> {
+        let halves = self.0.accept_bi().await.map_err(js_err)?;
+        Ok(BiStream::from_quic(halves))
     }
 
-    /// Sets how many peer-opened bidi streams may be open at once (QUIC stream credit).
+    /// How many peer-opened bidirectional streams may be open at the same time (stream credit).
     #[napi]
     pub fn set_max_concurrent_bi_streams(&self, n: u32) {
-        self.0.set_max_concurrent_bi_streams(VarInt::from_u32(n));
+        self.0.set_max_concurrent_bi_streams(n.into());
     }
 
-    /// Closes the connection with an application code and reason (string or bytes).
+    /// Closes with an application code and a reason given as text or bytes.
     #[napi]
     pub fn close(&self, code: u32, reason: Either<String, Uint8Array>) {
-        let bytes: Vec<u8> = match reason {
-            Either::A(s) => s.into_bytes(),
-            Either::B(b) => b.to_vec(),
+        let reason = match &reason {
+            Either::A(text) => text.as_bytes(),
+            Either::B(bytes) => bytes.as_ref(),
         };
-        self.0.close(VarInt::from_u32(code), &bytes);
+        self.0.close(VarInt::from_u32(code), reason);
     }
 
-    /// Resolves with the numeric close code and reason once the connection ends.
+    /// Resolves with the close code and reason once the connection has ended.
     #[napi]
     pub async fn closed(&self) -> CloseInfo {
-        close_info(self.0.closed().await)
+        CloseInfo::from(self.0.closed().await)
     }
 
-    /// "direct" if the selected path is UDP, "relay" if it goes through the relay, else "none".
+    /// "direct" when the path in use is UDP, "relay" when it goes through the relay, else "none".
     #[napi]
     pub fn path_kind(&self) -> String {
-        let paths = self.0.paths();
-        match paths.iter().find(|p| p.is_selected()) {
-            Some(p) if p.is_ip() => "direct".into(),
-            Some(p) if p.is_relay() => "relay".into(),
-            _ => "none".into(),
+        let kind = self.selected_path(|path| {
+            if path.is_ip() {
+                "direct"
+            } else if path.is_relay() {
+                "relay"
+            } else {
+                "none"
+            }
+        });
+        match kind {
+            Some(kind) => kind.to_owned(),
+            // No path is selected yet.
+            None => "none".to_owned(),
         }
     }
 
-    /// Remote socket address (`host:port`) of the selected path when it is direct, else null.
+    /// The peer's `host:port` when the path in use is direct, else null.
     #[napi]
     pub fn direct_remote_addr(&self) -> Option<String> {
-        let paths = self.0.paths();
-        let selected = paths.iter().find(|p| p.is_selected())?;
-        match selected.remote_addr() {
+        self.selected_path(|path| match path.remote_addr() {
             TransportAddr::Ip(addr) => Some(addr.to_string()),
             _ => None,
-        }
+        })
+        .flatten()
     }
 
     /// Traffic counters since the connection was established.
     #[napi]
     pub fn stats(&self) -> ConnectionStats {
-        let s = self.0.stats();
+        let stats = self.0.stats();
         ConnectionStats {
-            udp_rx_bytes: s.udp_rx.bytes as f64,
-            udp_tx_bytes: s.udp_tx.bytes as f64,
-            udp_rx_datagrams: s.udp_rx.datagrams as f64,
-            udp_tx_datagrams: s.udp_tx.datagrams as f64,
-            lost_packets: s.lost_packets as f64,
+            udp_rx_bytes: stats.udp_rx.bytes as f64,
+            udp_tx_bytes: stats.udp_tx.bytes as f64,
+            udp_rx_datagrams: stats.udp_rx.datagrams as f64,
+            udp_tx_datagrams: stats.udp_tx.datagrams as f64,
+            lost_packets: stats.lost_packets as f64,
         }
     }
 
-    /// Largest payload `sendDatagram` takes right now, or null if the peer does not accept
+    /// The largest payload `sendDatagram` accepts right now; null when the peer takes no
     /// datagrams.
     #[napi]
     pub fn max_datagram_size(&self) -> Option<u32> {
-        self.0.max_datagram_size().map(|n| n as u32)
+        let size = self.0.max_datagram_size()?;
+        Some(size as u32)
     }
 
-    /// Sends an unreliable datagram (one copy). Throws if it is too large, the peer does not
-    /// accept datagrams or the connection is closed.
+    /// Sends one unreliable datagram (copied once). Throws when it is too large, the peer takes no
+    /// datagrams or the connection is closed.
     #[napi]
     pub fn send_datagram(&self, data: &[u8]) -> Result<()> {
-        self.0
-            .send_datagram(Bytes::copy_from_slice(data))
-            .map_err(js_err)
+        let payload = Bytes::copy_from_slice(data);
+        self.0.send_datagram(payload).map_err(js_err)
     }
 
-    /// Resolves with the next received datagram; rejects once the connection is closed.
+    /// Resolves with the next datagram received; rejects once the connection is closed.
     #[napi]
     pub async fn read_datagram(&self) -> Result<Buffer> {
-        let datagram = self.0.read_datagram().await.map_err(js_err)?;
-        Ok(Vec::from(datagram).into())
+        match self.0.read_datagram().await {
+            Ok(datagram) => Ok(Buffer::from(datagram.to_vec())),
+            Err(error) => Err(js_err(error)),
+        }
     }
 
-    /// Round-trip time of the selected path in milliseconds, if known.
+    /// Round-trip time of the path in use, in milliseconds, when known.
     #[napi]
     pub fn rtt_ms(&self) -> Option<f64> {
-        let paths = self.0.paths();
-        paths
-            .iter()
-            .find(|p| p.is_selected())
-            .map(|p| p.rtt().as_secs_f64() * 1000.0)
-    }
-}
-
-// Maps a connection error to a code/reason/kind triple for JS.
-fn close_info(e: ConnectionError) -> CloseInfo {
-    let (code, reason, kind) = match &e {
-        ConnectionError::ApplicationClosed(c) => (
-            Some(c.error_code.into_inner() as u32),
-            String::from_utf8_lossy(&c.reason).into_owned(),
-            "application",
-        ),
-        ConnectionError::LocallyClosed => (None, e.to_string(), "locally_closed"),
-        ConnectionError::TimedOut => (None, e.to_string(), "timed_out"),
-        ConnectionError::Reset => (None, e.to_string(), "reset"),
-        _ => (None, e.to_string(), "transport"),
-    };
-    CloseInfo {
-        code,
-        reason,
-        kind: kind.into(),
+        self.selected_path(|path| path.rtt().as_secs_f64() * 1e3)
     }
 }

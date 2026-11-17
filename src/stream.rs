@@ -26,12 +26,18 @@ use tokio::sync::{Notify, watch};
 
 use crate::js_err;
 
-// Resolves once `stop` or `reset` has been requested for this half. The sender lives as long as
-// the half itself, so a dropped sender means nobody can cancel and the wait never resolves.
-async fn cancelled(mut rx: watch::Receiver<bool>) {
-    if rx.wait_for(|requested| *requested).await.is_err() {
-        std::future::pending::<()>().await;
+// Completes when this half has been asked to stop or reset. The flag's sender is owned by the half,
+// so when it is gone no request can come any more and this never completes.
+async fn cancelled(mut flag: watch::Receiver<bool>) {
+    loop {
+        if *flag.borrow_and_update() {
+            return;
+        }
+        if flag.changed().await.is_err() {
+            break;
+        }
     }
+    std::future::pending::<()>().await
 }
 
 // Work the JS thread may settle in a row without going back to the event loop. An `await` on an

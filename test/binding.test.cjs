@@ -1,6 +1,6 @@
-// Binding contract without network services: exported API shape (what the SUDO-AI tunnel adapter
-// consumes), direct own <-> own data integrity, admission identity, numeric close codes and stream
-// reset codes. Runs on every CI platform.
+// What the SUDO-AI tunnel relies on, checked without any network service: the exported API, byte
+// integrity over a direct own <-> own path, the peer identities both sides see, numeric close codes
+// and stream reset codes. Runs on every CI platform.
 "use strict";
 const assert = require("node:assert/strict");
 const { execFile } = require("node:child_process");
@@ -8,173 +8,182 @@ const crypto = require("node:crypto");
 const { test } = require("node:test");
 const { promisify } = require("node:util");
 const binding = require("../index.js");
-const { load, loopbackAddrs } = require("./support/adapters.cjs");
-const { ALPN, serveEndpoint, echo } = require("./support/proto.cjs");
+const { load, loopbackAddrs } = require("./helpers/bindings.cjs");
+const { ALPN, serveEndpoint, echo } = require("./helpers/wire.cjs");
 
-// Public JS API; any change here is a contract change for the SUDO-AI tunnel adapter.
+// The public JS surface by class. Changing it changes the contract with the tunnel adapter.
 const API = {
-  Endpoint: [
-    "accept",
-    "acceptIncoming",
-    "addExternalAddr",
-    "boundSockets",
-    "close",
-    "connect",
-    "homeRelayStatus",
-    "id",
-    "online",
-    "removeExternalAddr",
-    "watchHomeRelay",
-  ],
+  Endpoint: ["accept", "acceptIncoming", "addExternalAddr", "boundSockets", "close", "connect", "homeRelayStatus", "id", "online", "removeExternalAddr", "watchHomeRelay"],
   Incoming: ["complete", "pathKind", "refuse", "remoteAddr"],
   HomeRelayWatcher: ["next"],
-  Connection: [
-    "acceptBi",
-    "alpn",
-    "close",
-    "closed",
-    "directRemoteAddr",
-    "maxDatagramSize",
-    "openBi",
-    "pathKind",
-    "readDatagram",
-    "remoteId",
-    "rttMs",
-    "sendDatagram",
-    "setMaxConcurrentBiStreams",
-    "stats",
-  ],
+  Connection: ["acceptBi", "alpn", "close", "closed", "directRemoteAddr", "maxDatagramSize", "openBi", "pathKind", "readDatagram", "remoteId", "rttMs", "sendDatagram", "setMaxConcurrentBiStreams", "stats"],
   SendStream: ["finish", "flush", "reset", "write", "writeMany"],
   RecvStream: ["read", "stop"],
 };
 
-// Binds a server (accepting ALPN) and a client, both with relays disabled, and dials directly.
+const newKey = () => crypto.randomBytes(32);
+
+// A server that accepts ALPN and a client, relays off, connected directly over loopback.
 async function directPair() {
-  const server = await binding.bind({ secretKey: crypto.randomBytes(32), alpns: [ALPN] });
-  const client = await binding.bind({ secretKey: crypto.randomBytes(32), keepAliveMs: 1_000 });
-  const accepted = server.accept();
-  const conn = await client.connect(server.id(), ALPN, {
-    directAddrs: loopbackAddrs(server.boundSockets()),
-  });
-  return { server, client, conn, sconn: await accepted };
+  const server = await binding.bind({ secretKey: newKey(), alpns: [ALPN] });
+  const client = await binding.bind({ secretKey: newKey(), keepAliveMs: 1_000 });
+  const serverSide = server.accept();
+  const conn = await client.connect(server.id(), ALPN, { directAddrs: loopbackAddrs(server.boundSockets()) });
+  return { server, client, conn, sconn: await serverSide };
+}
+
+async function closeBoth({ server, client }) {
+  await client.close();
+  await server.close();
 }
 
 test("exports the binding API", () => {
   assert.equal(typeof binding.bind, "function");
-  for (const [cls, methods] of Object.entries(API)) {
-    const own = Object.getOwnPropertyNames(binding[cls].prototype).filter(
-      (n) => n !== "constructor",
-    );
-    assert.deepEqual(own.toSorted(), methods, cls);
+  for (const [name, expected] of Object.entries(API)) {
+    const methods = Object.getOwnPropertyNames(binding[name].prototype).filter((key) => key !== "constructor");
+    assert.deepEqual([...methods].sort(), expected, name);
   }
 });
 
-test("rejects a zero keep-alive interval", async () => {
-  await assert.rejects(
-    binding.bind({ secretKey: crypto.randomBytes(32), keepAliveMs: 0 }),
-    /keepAliveMs must be positive/,
-  );
+test("bind refuses a keep-alive of 0 ms", async () => {
+  await assert.rejects(binding.bind({ secretKey: newKey(), keepAliveMs: 0 }), /keepAliveMs must be positive/);
 });
 
-test("rejects a secret key that is not 32 bytes", async () => {
+test("bind refuses a secret key of the wrong length", async () => {
   await assert.rejects(binding.bind({ secretKey: new Uint8Array(31) }), /32 bytes/);
+  await assert.rejects(binding.bind({ secretKey: new Uint8Array(33) }), /32 bytes/);
 });
 
-for (const pending of [true, false]) {
-  test(`home relay watcher ends and Node exits with a ${pending ? "pending" : "later"} next`, async () => {
-    // A stuck native promise keeps Node alive even after JS finishes. Isolate it so the
-    // parent can bound the regression without forcing a successful child's exit.
-    const { stdout } = await promisify(execFile)(
-      process.execPath,
-      [
-        "-e",
-        `
-        const assert = require("node:assert/strict");
-        const { bind } = require(${JSON.stringify(require.resolve("../index.js"))});
-        (async () => {
-          const endpoint = await bind({ secretKey: require("node:crypto").randomBytes(32) });
-          const watcher = await endpoint.watchHomeRelay();
-          assert.deepEqual(await watcher.next(), []);
-          const next = ${pending} ? watcher.next() : undefined;
-          await endpoint.close();
-          console.log("endpoint closed");
-          assert.equal(await (next ?? watcher.next()), null);
-          assert.equal(await watcher.next(), null);
-          console.log("watcher ended");
-        })().catch((error) => {
-          console.error(error);
-          process.exitCode = 1;
-        });
-      `,
-      ],
-      { timeout: 10000 },
-    );
+test("bind reports a bad relay URL and a bad bind address", async () => {
+  await assert.rejects(binding.bind({ secretKey: newKey(), relayUrl: "not a url" }));
+  await assert.rejects(binding.bind({ secretKey: newKey(), bindAddr: "nowhere" }), /invalid/i);
+});
+
+test("bind honours ipTransports=false and an explicit bind address", async () => {
+  // Relay only needs a relay; nothing listens there, so it binds and never gets online.
+  const relayOnly = await binding.bind({ secretKey: newKey(), ipTransports: false, relayUrl: "https://127.0.0.1:9" });
+  const pinned = await binding.bind({ secretKey: newKey(), bindAddr: "127.0.0.1:0" });
+  try {
+    assert.deepEqual(relayOnly.boundSockets(), []);
+    // The given IPv4 socket replaces the default one; iroh still adds its IPv6 socket.
+    const ipv4 = pinned.boundSockets().filter((socket) => !socket.startsWith("["));
+    assert.ok(ipv4.length > 0 && ipv4.every((socket) => socket.startsWith("127.0.0.1:")), String(pinned.boundSockets()));
+  } finally {
+    await relayOnly.close();
+    await pinned.close();
+  }
+});
+
+for (const waitFirst of [true, false]) {
+  test(`the home relay watcher ends and Node exits with a ${waitFirst ? "pending" : "later"} next`, async () => {
+    // A native promise that never settles keeps Node running after JS is done, so the check runs in
+    // a child process the parent can time out.
+    const script = `
+      const assert = require("node:assert/strict");
+      const { bind } = require(${JSON.stringify(require.resolve("../index.js"))});
+      (async () => {
+        const endpoint = await bind({ secretKey: require("node:crypto").randomBytes(32) });
+        const watcher = await endpoint.watchHomeRelay();
+        assert.deepEqual(await watcher.next(), []);
+        const waiting = ${waitFirst} ? watcher.next() : undefined;
+        await endpoint.close();
+        console.log("endpoint closed");
+        assert.equal(await (waiting ?? watcher.next()), null);
+        assert.equal(await watcher.next(), null);
+        console.log("watcher ended");
+      })().catch((error) => {
+        console.error(error);
+        process.exitCode = 1;
+      });
+    `;
+    const { stdout } = await promisify(execFile)(process.execPath, ["-e", script], { timeout: 10_000 });
     assert.equal(stdout.replaceAll("\r\n", "\n"), "endpoint closed\nwatcher ended\n");
   });
 }
 
 test("direct echo keeps every byte and reports the authenticated peer", async () => {
   const own = load("own");
-  const server = await own.bind({ secretKey: crypto.randomBytes(32), alpns: [ALPN] });
+  const server = await own.bind({ secretKey: newKey(), alpns: [ALPN] });
   const serving = serveEndpoint(server);
-  const client = await own.bind({ secretKey: crypto.randomBytes(32) });
+  const client = await own.bind({ secretKey: newKey() });
   try {
     const conn = await client.connect(server.id(), ALPN, { directAddrs: server.directAddrs() });
-    assert.equal(conn.remoteId(), server.id());
     assert.match(server.id(), /^[0-9a-f]{64}$/);
-    const r = await echo(conn, 4 << 20);
-    assert.equal(r.received, r.sent);
+    assert.equal(conn.remoteId(), server.id());
+    const { sent, received } = await echo(conn, 4 << 20);
+    assert.equal(received, sent);
     assert.equal(conn.pathKind(), "direct");
     assert.equal(typeof conn.raw.rttMs(), "number");
   } finally {
-    await client.close();
-    await server.close();
+    await closeBoth({ server, client });
     await serving;
   }
 });
 
-test("server sees the client's authenticated id", async () => {
-  const { server, client, sconn } = await directPair();
+test("the server sees the client's authenticated id", async () => {
+  const pair = await directPair();
   try {
-    assert.equal(sconn.remoteId(), client.id());
+    assert.equal(pair.sconn.remoteId(), pair.client.id());
   } finally {
-    await client.close();
-    await server.close();
+    await closeBoth(pair);
   }
 });
 
-test("application close code and reason reach the peer", async () => {
-  const { server, client, conn, sconn } = await directPair();
+test("an application close code and reason reach the peer, as text or bytes", async () => {
+  const pair = await directPair();
   try {
-    sconn.close(1, "not a member");
-    assert.deepEqual(
-      { ...(await conn.closed()) },
-      {
-        code: 1,
-        reason: "not a member",
-        kind: "application",
-      },
-    );
+    pair.sconn.close(1, "not a member");
+    assert.deepEqual({ ...(await pair.conn.closed()) }, { code: 1, reason: "not a member", kind: "application" });
   } finally {
-    await client.close();
-    await server.close();
+    await closeBoth(pair);
+  }
+  const bytes = await directPair();
+  try {
+    bytes.conn.close(4, new Uint8Array([0x6f, 0x6b, 0xff]));
+    assert.deepEqual({ ...(await bytes.sconn.closed()) }, { code: 4, reason: "ok�", kind: "application" });
+    // The side that closed sees its own close.
+    assert.equal((await bytes.conn.closed()).kind, "locally_closed");
+  } finally {
+    await closeBoth(bytes);
   }
 });
 
-test("stream reset code is visible to the reader", async () => {
-  const { server, client, conn, sconn } = await directPair();
+test("a stream reset code is visible to the reader", async () => {
+  const pair = await directPair();
   try {
-    const peerStream = sconn.acceptBi();
-    const { send } = await conn.openBi();
+    const accepted = pair.sconn.acceptBi();
+    const { send } = await pair.conn.openBi();
     await send.write(Buffer.from("x"));
-    const { recv } = await peerStream;
-    assert.equal((await recv.read(1)).toString(), "x");
+    const { recv } = await accepted;
+    assert.equal(String(await recv.read(1)), "x");
     await send.reset(3);
-    // The exact text is part of the contract: callers parse the code out of it.
+    // Callers parse the code out of this exact text.
     await assert.rejects(recv.read(16), /^Error: stream reset by peer: error 3$/);
   } finally {
-    await client.close();
-    await server.close();
+    await closeBoth(pair);
+  }
+});
+
+test("raising the peer's stream limit lets more streams be open at once", async () => {
+  const pair = await directPair();
+  try {
+    // Far beyond the default limit; none of these streams finishes while the others open.
+    const count = 300;
+    pair.sconn.setMaxConcurrentBiStreams(count);
+    const accepted = [];
+    const accepting = (async () => {
+      while (accepted.length < count) accepted.push(await pair.sconn.acceptBi());
+    })();
+    const opened = [];
+    for (let i = 0; i < count; i++) {
+      const bi = await within(pair.conn.openBi(), 5000, `stream ${i}`);
+      await bi.send.write(Buffer.from([i & 0xff]));
+      opened.push(bi);
+    }
+    await within(accepting, 5000, "accepting");
+    assert.equal(accepted.length, count);
+  } finally {
+    await closeBoth(pair);
   }
 });
 

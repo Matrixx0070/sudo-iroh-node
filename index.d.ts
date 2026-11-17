@@ -11,105 +11,105 @@ export declare const __napiBindingTarget: 'native' | 'wasm32-wasi' | 'wasm32-was
 
 /** An established QUIC connection. */
 export declare class Connection {
-  /** Remote endpoint id (lowercase hex), authenticated by the TLS handshake. */
+  /** The peer's endpoint id (lowercase hex), proven by the TLS handshake. */
   remoteId(): string
-  /** The ALPN protocol the handshake agreed on. */
+  /** The ALPN protocol both sides agreed on. */
   alpn(): Buffer
   /** Opens a bidirectional stream. */
   openBi(): Promise<{ send: SendStream, recv: RecvStream }>
-  /** Accepts the next peer-opened bidirectional stream; rejects once the connection is closed. */
+  /** Takes the next bidirectional stream the peer opened; rejects once the connection is closed. */
   acceptBi(): Promise<{ send: SendStream, recv: RecvStream }>
-  /** Sets how many peer-opened bidi streams may be open at once (QUIC stream credit). */
+  /** How many peer-opened bidirectional streams may be open at the same time (stream credit). */
   setMaxConcurrentBiStreams(n: number): void
-  /** Closes the connection with an application code and reason (string or bytes). */
+  /** Closes with an application code and a reason given as text or bytes. */
   close(code: number, reason: string | Uint8Array): void
-  /** Resolves with the numeric close code and reason once the connection ends. */
+  /** Resolves with the close code and reason once the connection has ended. */
   closed(): Promise<CloseInfo>
-  /** "direct" if the selected path is UDP, "relay" if it goes through the relay, else "none". */
+  /** "direct" when the path in use is UDP, "relay" when it goes through the relay, else "none". */
   pathKind(): string
-  /** Remote socket address (`host:port`) of the selected path when it is direct, else null. */
+  /** The peer's `host:port` when the path in use is direct, else null. */
   directRemoteAddr(): string | null
   /** Traffic counters since the connection was established. */
   stats(): ConnectionStats
   /**
-   * Largest payload `sendDatagram` takes right now, or null if the peer does not accept
+   * The largest payload `sendDatagram` accepts right now; null when the peer takes no
    * datagrams.
    */
   maxDatagramSize(): number | null
   /**
-   * Sends an unreliable datagram (one copy). Throws if it is too large, the peer does not
-   * accept datagrams or the connection is closed.
+   * Sends one unreliable datagram (copied once). Throws when it is too large, the peer takes no
+   * datagrams or the connection is closed.
    */
   sendDatagram(data: Uint8Array): void
-  /** Resolves with the next received datagram; rejects once the connection is closed. */
+  /** Resolves with the next datagram received; rejects once the connection is closed. */
   readDatagram(): Promise<Buffer>
-  /** Round-trip time of the selected path in milliseconds, if known. */
+  /** Round-trip time of the path in use, in milliseconds, when known. */
   rttMs(): number | null
 }
 
 /** A bound iroh endpoint. */
 export declare class Endpoint {
-  /** This endpoint's id (lowercase hex public key). */
+  /** The endpoint id: the public key in lowercase hex. */
   id(): string
-  /** Local UDP socket addresses (`host:port`), for dialing directly. */
+  /** The local UDP sockets (`host:port`) peers can dial directly. */
   boundSockets(): Array<string>
-  /** Resolves once the endpoint is attached to its home relay. */
+  /** Resolves when the endpoint is attached to its home relay. */
   online(): Promise<void>
-  /** Current status of each home relay (empty before one is selected). */
+  /** The state of each home relay right now (empty until one is chosen). */
   homeRelayStatus(): Array<HomeRelayStatus>
-  /** Starts following home relay status, including a relay-side admission denial. */
+  /** Follows home relay state, a relay refusing admission included. */
   watchHomeRelay(): Promise<HomeRelayWatcher>
   /**
-   * Waits for the next incoming connection and completes its handshake.
-   * Resolves null once the endpoint is closed. A failed handshake rejects; call again.
+   * Takes the next incoming connection and runs its handshake. Null once the endpoint has
+   * closed; a failed handshake rejects and the caller simply calls again.
    */
   accept(): Promise<Connection | null>
   /**
-   * Waits for the next incoming connection without running its handshake, so the caller can
-   * accept the following one while this one completes, or refuse it by its source.
-   * Resolves null once the endpoint is closed.
+   * Takes the next incoming connection without its handshake, so the caller can take the one
+   * after it meanwhile, or turn it away by where it comes from. Null once the endpoint has
+   * closed.
    */
   acceptIncoming(): Promise<Incoming | null>
   /**
-   * Advertises an address (`host:port`) this endpoint is reachable at, e.g. a public address
-   * learned from outside. Peers try it as a direct path.
+   * Announces an address (`host:port`) this endpoint can be reached at, such as a public one
+   * learned elsewhere. Peers try it as a direct path.
    */
   addExternalAddr(addr: string): Promise<void>
-  /** Stops advertising an address added with `addExternalAddr`; false if it was not there. */
+  /** Stops announcing an address added with `addExternalAddr`; false when it was not there. */
   removeExternalAddr(addr: string): Promise<boolean>
-  /** Dials `endpointId` (hex) on `alpn`, via the given relay and/or direct addresses. */
+  /** Dials `endpointId` (hex) on `alpn` through the given relay and/or direct addresses. */
   connect(endpointId: string, alpn: Uint8Array, opts?: ConnectOptions | undefined | null): Promise<Connection>
-  /** Closes all connections and the endpoint. */
+  /** Closes every connection, then the endpoint. */
   close(): Promise<void>
 }
 
-/** Follows home relay status changes; see `Endpoint.watchHomeRelay`. */
+/** Delivers home relay status changes; see `Endpoint.watchHomeRelay`. */
 export declare class HomeRelayWatcher {
   /**
-   * Resolves with the status: at once on the first call, then after each change.
-   * Resolves null once the endpoint is closed.
+   * The status: right away on the first call, after each change on later calls, and null once
+   * the endpoint has closed.
    */
   next(): Promise<Array<HomeRelayStatus> | null>
 }
 
 /**
- * An incoming connection whose handshake has not run yet: look at where it comes from, then
- * `complete` or `refuse` it. Each can be called once.
+ * An incoming connection before its handshake. Look at where it comes from, then `complete` it
+ * or `refuse` it — one of the two, once.
  */
 export declare class Incoming {
   /**
-   * "direct" for a UDP packet from an IP address, "relay" via the relay, else "none"
-   * (also once the connection was completed or refused).
+   * "direct" for a UDP packet from an IP address, "relay" when it came through the relay, and
+   * "none" otherwise — including after `complete` or `refuse`.
    */
   pathKind(): string
   /**
-   * Remote socket address (`host:port`) of a direct incoming connection, else null. Not
-   * authenticated: the peer has not proven it owns this address or any endpoint id yet.
+   * `host:port` of a direct incoming connection, else null. Unauthenticated: the peer has not
+   * yet proven it owns this address or any endpoint id.
    */
   remoteAddr(): string | null
-  /** Runs the handshake. Rejects if it fails. */
+  /** Runs the handshake; rejects when it fails. */
   complete(): Promise<Connection>
-  /** Refuses the connection (the peer sees CONNECTION_REFUSED) without running the handshake. */
+  /** Turns the connection away without a handshake; the peer sees CONNECTION_REFUSED. */
   refuse(): void
 }
 
@@ -162,42 +162,45 @@ export declare class SendStream {
   reset(code: number): Promise<void>
 }
 
-/** Binds an endpoint with the Minimal preset (no pkarr, no n0 DNS, no n0 relays) and our relay only. */
+/**
+ * Binds an endpoint on the Minimal preset — no pkarr, no n0 DNS, no n0 relays — so the only
+ * relay it knows is the one given here.
+ */
 export declare function bind(opts: BindOptions): Promise<Endpoint>
 
 /** Options for `bind`. */
 export interface BindOptions {
-  /** 32 secret key bytes. */
+  /** The endpoint's secret key: exactly 32 bytes. */
   secretKey: Uint8Array
-  /** The only relay in the relay map; omitted means relays disabled. */
+  /** URL of the one relay this endpoint uses; without it no relay is used at all. */
   relayUrl?: string
-  /** Bearer token sent to the relay when attaching to it (relay-side admission). */
+  /** Bearer token presented to that relay when attaching (relay-side admission). */
   relayToken?: string
-  /** ALPNs this endpoint accepts (needed only to accept connections). */
+  /** Protocols (ALPN) this endpoint answers; only needed to accept connections. */
   alpns?: Array<Uint8Array>
-  /** Local UDP socket address (`host:port`); default is iroh's default. */
+  /** UDP socket to bind (`host:port`); iroh picks one when omitted. */
   bindAddr?: string
-  /** When false, no IP transports are bound: relay-only (like the browser). Default true. */
+  /** `false` binds no IP transport, so every path goes through the relay. Default `true`. */
   ipTransports?: boolean
-  /** QUIC connection keep-alive interval in milliseconds (nonzero). */
+  /** QUIC keep-alive interval in milliseconds; must not be 0. */
   keepAliveMs?: number
 }
 
-/** How a connection ended, as returned by `Connection.closed()`. */
+/** How a connection ended; what `Connection.closed()` resolves with. */
 export interface CloseInfo {
-  /** Application close code, when the peer or we closed with one; otherwise null. */
+  /** The application close code when either side closed with one; null otherwise. */
   code?: number
-  /** Application close reason (UTF-8, lossy) or the transport error text. */
+  /** The application close reason (UTF-8, invalid bytes replaced), or the transport error text. */
   reason: string
-  /** "application", "locally_closed", "timed_out", "reset" or "transport". */
+  /** One of "application", "locally_closed", "timed_out", "reset", "transport". */
   kind: string
 }
 
-/** Traffic counters of a connection, summed over all its paths. */
+/** Traffic counters of a connection, over all of its paths together. */
 export interface ConnectionStats {
-  /** Bytes received in UDP datagrams (QUIC overhead included). */
+  /** Bytes received in UDP datagrams, QUIC overhead included. */
   udpRxBytes: number
-  /** Bytes sent in UDP datagrams (QUIC overhead included). */
+  /** Bytes sent in UDP datagrams, QUIC overhead included. */
   udpTxBytes: number
   /** UDP datagrams received. */
   udpRxDatagrams: number
@@ -209,23 +212,23 @@ export interface ConnectionStats {
 
 /** Options for `Endpoint.connect`. */
 export interface ConnectOptions {
-  /** Relay URL of the remote endpoint. */
+  /** The remote endpoint's relay URL. */
   relayUrl?: string
-  /** Known direct UDP addresses (`host:port`) of the remote endpoint. */
+  /** UDP addresses (`host:port`) the remote endpoint is known to listen on. */
   directAddrs?: Array<string>
 }
 
-/** Connection state of one home relay. */
+/** The state of one home relay. */
 export interface HomeRelayStatus {
-  /** Relay URL. */
+  /** The relay's URL. */
   url: string
-  /** True while attached to the relay. */
+  /** Whether the endpoint is attached to it right now. */
   connected: boolean
-  /** Most recent connection error, for display only. */
+  /** The latest connection error, as text for display. */
   lastError?: string
   /**
-   * Set when the relay refused this endpoint's admission; retrying will not help
-   * until the relay's access policy changes.
+   * Present when the relay refused to admit this endpoint; trying again does not help until
+   * the relay's access policy changes.
    */
   authDeniedReason?: string
 }

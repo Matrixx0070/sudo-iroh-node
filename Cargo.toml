@@ -1,6 +1,6 @@
 [package]
 name = "sudo-iroh-node"
-version = "0.1.0"
+version = "0.1.1"
 description = "Node.js (napi-rs) binding for iroh endpoints and streams with Buffer-based I/O"
 edition = "2024"
 rust-version = "1.93"
