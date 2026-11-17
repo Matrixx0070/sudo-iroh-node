@@ -49,6 +49,57 @@ test("bind refuses a keep-alive of 0 ms", async () => {
   await assert.rejects(binding.bind({ secretKey: newKey(), keepAliveMs: 0 }), /keepAliveMs must be positive/);
 });
 
+test("bind refuses flow-control windows outside their range and takes the bounds", async () => {
+  const MiB = 1 << 20;
+  const cases = [
+    [{ streamWindow: 65_535 }, /streamWindow must be between 65536 and 67108864 bytes/],
+    [{ streamWindow: 64 * MiB + 1 }, /streamWindow must be between/],
+    [{ sendWindow: 65_535 }, /sendWindow must be between 65536 and 268435456 bytes/],
+    [{ sendWindow: 256 * MiB + 1 }, /sendWindow must be between/],
+  ];
+  for (const [opts, message] of cases) {
+    await assert.rejects(binding.bind({ secretKey: newKey(), ...opts }), message, JSON.stringify(opts));
+  }
+  for (const opts of [{ streamWindow: 65_536, sendWindow: 65_536 }, { streamWindow: 64 * MiB, sendWindow: 256 * MiB }]) {
+    const ep = await binding.bind({ secretKey: newKey(), ...opts });
+    await ep.close();
+  }
+});
+
+// Bytes the server lets in on a stream it never reads: about 1 MiB its reader takes ahead of JS,
+// plus its stream window. The client's flush settles only once QUIC has taken every byte.
+async function flushesAgainstIdleReader(streamWindow, bytes) {
+  const server = await binding.bind({ secretKey: newKey(), alpns: [ALPN], streamWindow });
+  const client = await binding.bind({ secretKey: newKey() });
+  try {
+    const serverSide = server.accept();
+    const conn = await client.connect(server.id(), ALPN, { directAddrs: loopbackAddrs(server.boundSockets()) });
+    const sconn = await serverSide;
+    const { send } = await conn.openBi();
+    await send.write(Buffer.alloc(1));
+    const held = await sconn.acceptBi(); // accepted, never read
+    // Writes past 1 MiB of backlog wait for QUIC, so none is awaited on its own.
+    const writes = [];
+    for (let sent = 1; sent < bytes; sent += 256 << 10) writes.push(send.write(Buffer.alloc(Math.min(256 << 10, bytes - sent))));
+    writes.push(send.flush());
+    const all = Promise.all(writes).then(() => true);
+    all.catch(() => {});
+    const flushed = await Promise.race([all, new Promise((r) => setTimeout(r, 1500, false))]);
+    void held;
+    return flushed;
+  } finally {
+    await client.close();
+    await server.close();
+  }
+}
+
+test("streamWindow bounds what a peer may send ahead of the reader", async () => {
+  // 3 MiB fits in 1 MiB read-ahead plus the 2.5 MiB default window...
+  assert.equal(await flushesAgainstIdleReader(undefined, 3 << 20), true);
+  // ...and not in 1 MiB plus a 64 KiB window: the writer stays blocked on flow control.
+  assert.equal(await flushesAgainstIdleReader(64 << 10, 3 << 20), false);
+});
+
 test("bind refuses a secret key of the wrong length", async () => {
   await assert.rejects(binding.bind({ secretKey: new Uint8Array(31) }), /32 bytes/);
   await assert.rejects(binding.bind({ secretKey: new Uint8Array(33) }), /32 bytes/);

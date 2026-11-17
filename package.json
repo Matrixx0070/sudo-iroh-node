@@ -1,6 +1,6 @@
 {
   "name": "@sudo-ai/iroh-node",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Node.js binding for iroh endpoints and streams with Buffer-based I/O",
   "license": "MIT",
   "keywords": [
@@ -34,13 +34,13 @@
     "version": "napi version && node scripts/sync-versions.cjs && git add npm package.json Cargo.toml Cargo.lock index.js"
   },
   "optionalDependencies": {
-    "@sudo-ai/iroh-node-linux-x64-gnu": "0.1.1",
-    "@sudo-ai/iroh-node-linux-x64-musl": "0.1.1",
-    "@sudo-ai/iroh-node-linux-arm64-gnu": "0.1.1",
-    "@sudo-ai/iroh-node-linux-arm64-musl": "0.1.1",
-    "@sudo-ai/iroh-node-darwin-arm64": "0.1.1",
-    "@sudo-ai/iroh-node-darwin-x64": "0.1.1",
-    "@sudo-ai/iroh-node-win32-x64-msvc": "0.1.1"
+    "@sudo-ai/iroh-node-linux-x64-gnu": "0.1.2",
+    "@sudo-ai/iroh-node-linux-x64-musl": "0.1.2",
+    "@sudo-ai/iroh-node-linux-arm64-gnu": "0.1.2",
+    "@sudo-ai/iroh-node-linux-arm64-musl": "0.1.2",
+    "@sudo-ai/iroh-node-darwin-arm64": "0.1.2",
+    "@sudo-ai/iroh-node-darwin-x64": "0.1.2",
+    "@sudo-ai/iroh-node-win32-x64-msvc": "0.1.2"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.10.9"

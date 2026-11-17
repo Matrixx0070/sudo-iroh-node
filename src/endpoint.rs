@@ -6,7 +6,7 @@ use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use iroh::{
     Endpoint as IrohEndpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey,
     Watcher,
-    endpoint::{self, IncomingAddr, QuicTransportConfig, RelayStatus, presets},
+    endpoint::{self, IncomingAddr, QuicTransportConfig, RelayStatus, VarInt, presets},
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -31,6 +31,34 @@ pub struct BindOptions {
     pub ip_transports: Option<bool>,
     /// QUIC keep-alive interval in milliseconds; must not be 0.
     pub keep_alive_ms: Option<u32>,
+    /// Bytes one stream may receive ahead of the reader (its flow-control window). Bounds a single
+    /// stream to about `streamWindow / RTT`. Default 2.5 MiB; 64 KiB to 64 MiB.
+    pub stream_window: Option<u32>,
+    /// Bytes a connection may have sent and not yet acknowledged, over all its streams. Default
+    /// 20 MiB; 64 KiB to 256 MiB.
+    pub send_window: Option<u32>,
+}
+
+// Flow-control defaults, measured on a 50 ms RTT link: twice iroh's 1.25 MiB stream window doubles
+// what one stream carries, while eight connections at full speed on one socket still fit its send
+// buffer. Past that, iroh drops sends the socket cannot take, and the resulting holes make QUIC
+// close the connection ("too many gaps in stream buffer").
+const STREAM_WINDOW: u32 = 5 << 19;
+const SEND_WINDOW: u32 = 20 << 20;
+const MIN_WINDOW: u32 = 64 << 10;
+const MAX_STREAM_WINDOW: u32 = 64 << 20;
+const MAX_SEND_WINDOW: u32 = 256 << 20;
+
+// `value`, or `default` when absent, if it lies in MIN_WINDOW..=max.
+fn window(name: &str, value: Option<u32>, default: u32, max: u32) -> Result<u32> {
+    let bytes = value.unwrap_or(default);
+    if (MIN_WINDOW..=max).contains(&bytes) {
+        Ok(bytes)
+    } else {
+        Err(js_err(format!(
+            "{name} must be between {MIN_WINDOW} and {max} bytes"
+        )))
+    }
 }
 
 // A `host:port` string as a socket address.
@@ -63,28 +91,56 @@ fn relay_mode(url: Option<&str>, token: Option<String>) -> Result<RelayMode> {
     }))
 }
 
-// The transport settings for a keep-alive interval, refusing a zero interval.
-fn keep_alive(ms: u32) -> Result<QuicTransportConfig> {
+// A keep-alive interval, refusing a zero interval.
+fn keep_alive(ms: u32) -> Result<Duration> {
     if ms > 0 {
-        let interval = Duration::from_millis(ms.into());
-        Ok(QuicTransportConfig::builder().keep_alive_interval(interval).build())
+        Ok(Duration::from_millis(ms.into()))
     } else {
         Err(js_err("keepAliveMs must be positive"))
     }
+}
+
+// The QUIC transport settings: flow-control windows, and the keep-alive interval when given.
+fn transport(
+    keep_alive_ms: Option<u32>,
+    stream: Option<u32>,
+    send: Option<u32>,
+) -> Result<QuicTransportConfig> {
+    let stream = window("streamWindow", stream, STREAM_WINDOW, MAX_STREAM_WINDOW)?;
+    let send = window("sendWindow", send, SEND_WINDOW, MAX_SEND_WINDOW)?;
+    let mut config = QuicTransportConfig::builder()
+        .stream_receive_window(VarInt::from_u32(stream))
+        .send_window(send.into());
+    if let Some(ms) = keep_alive_ms {
+        config = config.keep_alive_interval(keep_alive(ms)?);
+    }
+    Ok(config.build())
 }
 
 /// Binds an endpoint on the Minimal preset — no pkarr, no n0 DNS, no n0 relays — so the only
 /// relay it knows is the one given here.
 #[napi]
 pub async fn bind(opts: BindOptions) -> Result<Endpoint> {
-    let BindOptions { secret_key: key, relay_url, relay_token, alpns, bind_addr, ip_transports, keep_alive_ms } = opts;
+    let BindOptions {
+        secret_key: key,
+        relay_url,
+        relay_token,
+        alpns,
+        bind_addr,
+        ip_transports,
+        keep_alive_ms,
+        stream_window,
+        send_window,
+    } = opts;
     let key = secret_key(&key)?;
     let relays = relay_mode(relay_url.as_deref(), relay_token)?;
     let protocols: Vec<Vec<u8>> = alpns.into_iter().flatten().map(|alpn| alpn.to_vec()).collect();
-    let mut builder = IrohEndpoint::builder(presets::Minimal).secret_key(key).alpns(protocols).relay_mode(relays);
-    if let Some(ms) = keep_alive_ms {
-        builder = builder.transport_config(keep_alive(ms)?);
-    }
+    let config = transport(keep_alive_ms, stream_window, send_window)?;
+    let mut builder = IrohEndpoint::builder(presets::Minimal)
+        .secret_key(key)
+        .alpns(protocols)
+        .relay_mode(relays)
+        .transport_config(config);
     if matches!(ip_transports, Some(false)) {
         builder = builder.clear_ip_transports();
     }
@@ -107,7 +163,11 @@ pub struct ConnectOptions {
 // Where to find a peer: its id plus whatever relay and direct addresses the caller knows.
 fn peer_addr(endpoint_id: &str, opts: Option<ConnectOptions>) -> Result<EndpointAddr> {
     let mut addr = EndpointAddr::new(EndpointId::from_str(endpoint_id).map_err(js_err)?);
-    let Some(ConnectOptions { relay_url: relay, direct_addrs }) = opts else {
+    let Some(ConnectOptions {
+        relay_url: relay,
+        direct_addrs,
+    }) = opts
+    else {
         return Ok(addr);
     };
     if let Some(url) = relay {
@@ -177,7 +237,9 @@ pub struct Incoming(std::sync::Mutex<Option<endpoint::Incoming>>);
 impl Incoming {
     fn slot(&self) -> std::sync::MutexGuard<'_, Option<endpoint::Incoming>> {
         // A poisoned lock still holds a valid Option.
-        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     // Hands the connection out exactly once.
@@ -277,7 +339,9 @@ impl Endpoint {
         // `publish` then ends every pending `next()` with null.
         let forward = async move {
             loop {
-                let Ok(list) = source.updated().await else { break };
+                let Ok(list) = source.updated().await else {
+                    break;
+                };
                 if publish.send(relay_statuses(&list)).is_err() {
                     break;
                 }
@@ -327,7 +391,12 @@ impl Endpoint {
 
     /// Dials `endpointId` (hex) on `alpn` through the given relay and/or direct addresses.
     #[napi]
-    pub async fn connect(&self, endpoint_id: String, alpn: Uint8Array, opts: Option<ConnectOptions>) -> Result<Connection> {
+    pub async fn connect(
+        &self,
+        endpoint_id: String,
+        alpn: Uint8Array,
+        opts: Option<ConnectOptions>,
+    ) -> Result<Connection> {
         let addr = peer_addr(&endpoint_id, opts)?;
         let connection = self.0.connect(addr, &alpn).await.map_err(js_err)?;
         Ok(Connection::new(connection))

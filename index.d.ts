@@ -184,6 +184,16 @@ export interface BindOptions {
   ipTransports?: boolean
   /** QUIC keep-alive interval in milliseconds; must not be 0. */
   keepAliveMs?: number
+  /**
+   * Bytes one stream may receive ahead of the reader (its flow-control window). Bounds a single
+   * stream to about `streamWindow / RTT`. Default 2.5 MiB; 64 KiB to 64 MiB.
+   */
+  streamWindow?: number
+  /**
+   * Bytes a connection may have sent and not yet acknowledged, over all its streams. Default
+   * 20 MiB; 64 KiB to 256 MiB.
+   */
+  sendWindow?: number
 }
 
 /** How a connection ended; what `Connection.closed()` resolves with. */

@@ -79,7 +79,15 @@ await server.close();
 **`bind(options) -> Promise<Endpoint>`** binds an endpoint with iroh's Minimal preset: no pkarr, no n0 DNS,
 no n0 relays. Options: `secretKey` (32 bytes), `alpns` (to accept connections), `relayUrl` (the only relay
 in the relay map; omitted = relays disabled), `relayToken` (bearer token for the relay), `bindAddr`
-(`host:port`), `ipTransports` (false = relay only), `keepAliveMs`.
+(`host:port`), `ipTransports` (false = relay only), `keepAliveMs`, `streamWindow` and `sendWindow`
+(flow-control windows in bytes, see below).
+
+Flow control: one stream carries at most about `streamWindow / RTT`. The defaults (2.5 MiB per stream,
+20 MiB unacknowledged per connection) are twice iroh's own, so a single stream moves twice as much on a
+link with real latency (measured: 22 vs 11 MB/s at 100 ms RTT, 42 vs 21 MB/s at 50 ms). Larger windows
+go faster still, but iroh drops packets its UDP socket cannot take, and when that leaves too many holes
+in a stream QUIC closes the connection ("too many gaps in stream buffer"); at 50 ms RTT that started
+from about 4 MiB per stream, and from 3 MiB with eight connections at full speed on one endpoint.
 
 **`Endpoint`**
 
